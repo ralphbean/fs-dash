@@ -1,0 +1,16 @@
+version = 1
+repositories = ["fullsend-ai/fullsend"]
+log_limit = 500
+
+[bindings.o]
+executable = "xdg-open"
+args = ["{url}"]
+detach = true
+
+# Example: launch your own terminal command. Placeholders are substituted in
+# individual arguments without a shell. Set a real working directory.
+# [bindings.c]
+# executable = "my-terminal-launcher"
+# args = ["codex", "Work on PR {url}"]
+# dir = "/home/me/code/my-project"
+# detach = true
