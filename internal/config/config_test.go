@@ -23,6 +23,37 @@ func TestMissingAndInvalidConfig(t *testing.T) {
 	}
 }
 
+func TestLegacyConfigUsesVisualDefaultsAndRejectsInvalidPreferences(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.toml")
+	if err := os.WriteFile(path, []byte("version = 1\nlog_limit = 500\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := (Loader{Path: path}).Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Theme != "dark" || cfg.Color != "auto" {
+		t.Fatalf("legacy config did not keep visual defaults: theme=%q color=%q", cfg.Theme, cfg.Color)
+	}
+
+	for _, tc := range []struct {
+		name  string
+		field string
+	}{
+		{name: "theme", field: "theme = \"sepia\""},
+		{name: "color", field: "color = \"always\""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := os.WriteFile(path, []byte("version = 1\nlog_limit = 500\n"+tc.field+"\n"), 0600); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := (Loader{Path: path}).Load(); err == nil {
+				t.Fatalf("accepted invalid %s preference", tc.name)
+			}
+		})
+	}
+}
+
 func TestBindingKeepsURLAsSingleArgument(t *testing.T) {
 	pr := domain.PR{ID: domain.ItemID{Repo: "owner/repo", Number: 3}, URL: "https://github.com/owner/repo/pull/3", Title: "spaces and $(touch /tmp/never)"}
 	dir := t.TempDir()

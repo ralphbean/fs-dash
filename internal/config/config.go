@@ -28,6 +28,8 @@ type Config struct {
 	Repositories []string           `toml:"repositories"`
 	Bindings     map[string]Binding `toml:"bindings"`
 	LogLimit     int                `toml:"log_limit"`
+	Theme        string             `toml:"theme"`
+	Color        string             `toml:"color"`
 }
 
 type Loader struct{ Path string }
@@ -37,7 +39,7 @@ func Default() Config {
 	if runtime.GOOS == "darwin" {
 		opener = "open"
 	}
-	return Config{Version: 1, LogLimit: 500, Bindings: map[string]Binding{"o": {Executable: opener, Args: []string{"{url}"}, Detach: true}}}
+	return Config{Version: 1, LogLimit: 500, Theme: "dark", Color: "auto", Bindings: map[string]Binding{"o": {Executable: opener, Args: []string{"{url}"}, Detach: true}}}
 }
 
 func DefaultPath() (string, error) {
@@ -90,6 +92,12 @@ func (c Config) Validate() error {
 	}
 	if c.LogLimit < 1 || c.LogLimit > 10000 {
 		return fmt.Errorf("log_limit must be between 1 and 10000")
+	}
+	if c.Theme != "dark" && c.Theme != "light" {
+		return fmt.Errorf("theme must be \"dark\" or \"light\"")
+	}
+	if c.Color != "auto" && c.Color != "never" {
+		return fmt.Errorf("color must be \"auto\" or \"never\"")
 	}
 	for _, repo := range c.Repositories {
 		if !repoPattern.MatchString(repo) {

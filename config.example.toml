@@ -1,6 +1,8 @@
 version = 1
 repositories = ["fullsend-ai/fullsend"]
 log_limit = 500
+theme = "dark" # dark or light
+color = "auto" # auto or never; NO_COLOR is always honored
 
 [bindings.o]
 executable = "xdg-open"

@@ -13,7 +13,6 @@ import (
 	"github.com/fullsend-ai/fs-dash/internal/domain"
 	"github.com/fullsend-ai/fs-dash/internal/fetch"
 	"github.com/fullsend-ai/fs-dash/internal/ports"
-	"github.com/mattn/go-runewidth"
 )
 
 type Options struct {
@@ -48,6 +47,7 @@ type Model struct {
 	status                          string
 	fields                          map[domain.FieldKey]*domain.Field[any]
 	fieldAttempts                   map[domain.FieldKey]int
+	visual                          visualTheme
 }
 type listMsg struct {
 	repo       string
@@ -87,6 +87,12 @@ func New(opts Options) Model {
 	if opts.Config.Version == 0 {
 		opts.Config = config.Default()
 	}
+	if opts.Config.Theme == "" {
+		opts.Config.Theme = "dark"
+	}
+	if opts.Config.Color == "" {
+		opts.Config.Color = "auto"
+	}
 	if opts.Scheduler == nil {
 		opts.Scheduler = fetch.NewScheduler(2, 20*time.Second)
 	}
@@ -96,7 +102,8 @@ func New(opts Options) Model {
 	if opts.Clock == nil {
 		opts.Clock = realClock{}
 	}
-	m := Model{opts: opts, mode: "list", logLevel: "all", width: 100, height: 30, fields: map[domain.FieldKey]*domain.Field[any]{}, fieldAttempts: map[domain.FieldKey]int{}}
+	m := Model{opts: opts, mode: "list", logLevel: "all", width: 100, height: 30, fields: map[domain.FieldKey]*domain.Field[any]{}, fieldAttempts: map[domain.FieldKey]int{}, visual: newVisualTheme(opts.Config)}
+	m.visual.compact = m.width < 64
 	for _, repo := range opts.Repos {
 		f := domain.NewField[[]domain.PR]()
 		g := f.Queue()
@@ -253,6 +260,7 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := message.(type) {
 	case tea.WindowSizeMsg:
 		m.width, m.height = msg.Width, msg.Height
+		m.visual.compact = msg.Width < 64
 	case tickMsg:
 		m.tickRunning = false
 		m.frame = (m.frame + 1) % len(frames)
@@ -429,28 +437,31 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 	return m, tea.Batch(cmds...)
 }
 func (m Model) spinner() string { return frames[m.frame%len(frames)] }
-func (m Model) sectionStatus(s section) string {
+func (m Model) sectionStatus(s section) (string, visualRole) {
 	switch s.field.Phase {
-	case domain.Queued, domain.Fetching:
-		return m.spinner() + " loading"
+	case domain.Queued:
+		return "◌ queued", roleQueued
+	case domain.Fetching:
+		return m.spinner() + " loading", rolePending
 	case domain.Cooldown:
-		return fmt.Sprintf("! cooldown until %s: %s", s.field.RetryAt.Format("15:04:05"), s.field.Error.Message)
+		return fmt.Sprintf("◷ cooldown until %s: %s", s.field.RetryAt.Format("15:04:05"), s.field.Error.Message), roleCooling
 	case domain.Failed:
-		return "! " + s.field.Error.Message + " (r to retry)"
+		return "× failed: " + s.field.Error.Message + " (r to retry)", roleFailure
 	case domain.Canceled:
-		return "canceled (r to retry)"
+		return "○ canceled (r to retry)", roleCanceled
 	case domain.Ready:
 		if s.field.Stale(m.opts.Clock.Now()) {
-			return "stale · r to refresh"
+			return "△ stale · r to refresh", roleStale
 		}
 		if len(s.field.Value) == 0 {
-			return "empty"
+			return "— empty", roleMuted
 		}
-		return fmt.Sprintf("%d open", len(s.field.Value))
+		return fmt.Sprintf("● %d open", len(s.field.Value)), roleSuccess
 	default:
-		return "not requested"
+		return "○ not requested", roleUnrequested
 	}
 }
+
 func (m Model) View() string {
 	if m.console {
 		return m.consoleView()
@@ -461,31 +472,48 @@ func (m Model) View() string {
 	if m.mode == "details" {
 		return m.detailsView()
 	}
-	var out strings.Builder
 	scope := "no repository configured"
 	if len(m.opts.Repos) > 0 {
 		scope = strings.Join(m.opts.Repos, ", ")
 	}
-	fmt.Fprintf(&out, "fs-dash · Pull requests · %s\n\n", scope)
+	lines := m.visual.header("fs-dash · Pull requests", scope, m.width)
+	compact := m.visual.compact || m.width < 52
+	panelOverhead := 2
+	selected, hasSelected := m.selectedPR()
+	contextLines := 0
+	if hasSelected {
+		contextLines = 1 + panelOverhead
+		if m.opts.Enricher != nil {
+			contextLines++
+		}
+	}
+	statusLines := 0
+	if m.status != "" {
+		statusLines = 1
+	}
+	sectionBase := len(m.sections) * (panelOverhead + 1)
 	if len(m.sections) == 0 {
-		out.WriteString("No GitHub repository found. Add repositories = [\"owner/name\"] to ~/.config/fs-dash/config.toml or run from a GitHub checkout.\n")
+		sectionBase = panelOverhead + 1
+	}
+	visibleRows := max(1, m.height-len(lines)-1-contextLines-statusLines-sectionBase)
+	selectedSection := ""
+	if hasSelected {
+		selectedSection = selected.ID.Repo
+	}
+
+	if len(m.sections) == 0 {
+		lines = append(lines, m.visual.panel("Repository scope", []string{"No GitHub repository found. Add repositories = [\"owner/name\"] to ~/.config/fs-dash/config.toml or run from a GitHub checkout."}, m.width)...)
 	}
 	for _, s := range m.sections {
-		fmt.Fprintf(&out, "%s  %s\n", s.repo, m.sectionStatus(s))
+		state, stateRole := m.sectionStatus(s)
+		title := m.visual.paint(roleAccent, s.repo) + " · " + m.visual.badge(state, stateRole)
+		content := []string{}
 		if s.field.HasValue {
-			selectedRepo := ""
-			if m.hasSelection {
-				selectedRepo = m.selected.Repo
+			if selectedSection != s.repo && len(s.field.Value) > 0 {
+				content = append(content, m.visual.paint(roleMuted, "Rows hidden; j/k selects across repositories."))
 			}
-			if selectedRepo != s.repo && len(s.field.Value) > 0 {
-				out.WriteString("  Rows hidden; j/k selects across repositories.\n")
-			}
-			if selectedRepo == s.repo {
-				reserved := 9 + len(m.sections)
-				if m.opts.Enricher != nil {
-					reserved++
-				}
-				visible := max(1, m.height-reserved)
+			if selectedSection == s.repo {
+				visible := min(visibleRows, len(s.field.Value))
 				index := 0
 				for i, pr := range s.field.Value {
 					if pr.ID == m.selected {
@@ -498,89 +526,102 @@ func (m Model) View() string {
 					start = max(0, len(s.field.Value)-visible)
 				}
 				end := min(len(s.field.Value), start+visible)
-				if start > 0 {
-					fmt.Fprintf(&out, "  ↑ %d earlier PRs\n", start)
-				}
 				for _, pr := range s.field.Value[start:end] {
 					marker := " "
 					if m.hasSelection && pr.ID == m.selected {
 						marker = ">"
 					}
-					titleWidth := max(12, m.width-48)
-					title := runewidth.Truncate(pr.Title, titleWidth, "…")
 					indicator := ""
+					indicatorRole := roleMuted
 					if m.opts.Enricher != nil {
 						key := domain.FieldKey{Item: pr.ID, Name: "review_summary", Revision: pr.HeadSHA}
 						if f := m.fields[key]; f != nil {
 							indicator = " " + f.DisplayState(m.opts.Clock.Now())
+							indicatorRole = phaseRole(f.Phase, f.Stale(m.opts.Clock.Now()))
 							if f.Phase.Active() {
-								indicator = " " + m.spinner()
+								indicator = " " + m.spinner() + " fetching"
 							}
 						} else {
-							indicator = " ·"
+							indicator = " not requested"
 						}
 					}
-					line := fmt.Sprintf("%s #%d %-*s @%s %s%s", marker, pr.ID.Number, titleWidth, title, pr.Author, pr.UpdatedAt.Local().Format("Jan 02 15:04"), indicator)
-					out.WriteString(runewidth.Truncate(line, max(20, m.width), "…"))
-					out.WriteByte('\n')
-				}
-				if end < len(s.field.Value) {
-					fmt.Fprintf(&out, "  ↓ %d more PRs\n", len(s.field.Value)-end)
+					lineWidth := m.width
+					if !compact {
+						lineWidth -= 4
+					}
+					content = append(content, m.visual.selected(marker, fmt.Sprint(pr.ID.Number), pr.Title, pr.Author, pr.UpdatedAt.Local().Format("Jan 02 15:04"), strings.TrimSpace(indicator), indicatorRole, max(1, lineWidth)))
 				}
 			}
 		}
-		out.WriteByte('\n')
+		if len(content) == 0 {
+			content = []string{m.visual.paint(roleMuted, "No pull requests to show.")}
+		}
+		lines = append(lines, m.visual.panel(title, content, m.width)...)
 	}
-	if pr, ok := m.selectedPR(); ok {
-		fmt.Fprintf(&out, "Selected: %s\n", pr.URL)
+	if hasSelected {
+		context := []string{m.visual.paint(roleMuted, "Selected: ") + m.visual.paint(roleLink, selected.URL)}
 		if m.opts.Enricher != nil {
-			key := domain.FieldKey{Item: pr.ID, Name: "review_summary", Revision: pr.HeadSHA}
+			key := domain.FieldKey{Item: selected.ID, Name: "review_summary", Revision: selected.HeadSHA}
 			if f := m.fields[key]; f != nil {
-				fmt.Fprintf(&out, "Review summary: %s", f.DisplayState(m.opts.Clock.Now()))
+				role := phaseRole(f.Phase, f.Stale(m.opts.Clock.Now()))
+				state := f.DisplayState(m.opts.Clock.Now())
 				if f.Phase == domain.Cooldown {
-					fmt.Fprintf(&out, " until %s", f.RetryAt.Local().Format("15:04:05"))
+					state += " until " + f.RetryAt.Local().Format("15:04:05")
 				}
 				if f.Error != nil {
-					fmt.Fprintf(&out, " · %s", f.Error.Message)
+					state += " · " + f.Error.Message
 				}
-				out.WriteByte('\n')
+				context = append(context, m.visual.paint(roleMuted, "Review summary: ")+m.visual.paint(role, state))
+			} else {
+				context = append(context, m.visual.paint(roleMuted, "Review summary: ")+m.visual.paint(rolePending, "queued"))
 			}
 		}
+		lines = append(lines, m.visual.context("Selected PR", context, m.width)...)
 	}
 	if m.status != "" {
-		fmt.Fprintf(&out, "%s\n", m.status)
+		lines = append(lines, m.visual.paint(roleWarning, m.visual.fit(m.status, m.width)))
 	}
-	out.WriteString("j/k move · enter details · r refresh · o open · L logs · ? help · q quit\n")
-	return out.String()
+	lines = append(lines, m.visual.footer("j/k move · enter details · r refresh · o open · L logs · ? help · q quit", m.width))
+	return strings.Join(lines, "\n") + "\n"
 }
+
 func (m Model) detailsView() string {
 	pr, ok := m.selectedPR()
 	if !ok {
-		return "PR no longer in list · esc back\n"
+		return strings.Join(m.visual.panel("PR details", []string{"PR no longer in list · esc back"}, m.width), "\n") + "\n"
 	}
-	var out strings.Builder
-	fmt.Fprintf(&out, "fs-dash · PR details\n\n%s #%d\n%s\n\nAuthor: %s\nUpdated: %s\nHead: %s\nURL: %s\n\n", pr.ID.Repo, pr.ID.Number, pr.Title, pr.Author, pr.UpdatedAt.Local().Format(time.RFC822), pr.HeadSHA, pr.URL)
-	out.WriteString("Detailed reviews, checks, and threads arrive in change 03.\n")
+	content := []string{
+		m.visual.paint(roleAccent, fmt.Sprintf("%s #%d", pr.ID.Repo, pr.ID.Number)),
+		m.visual.paint(roleNeutral, pr.Title),
+		"Author: " + m.visual.paint(roleNeutral, pr.Author),
+		"Updated: " + m.visual.paint(roleNeutral, pr.UpdatedAt.Local().Format(time.RFC822)),
+		"Head: " + m.visual.paint(roleMuted, pr.HeadSHA),
+		"URL: " + m.visual.paint(roleLink, pr.URL),
+		m.visual.paint(roleMuted, "Detailed reviews, checks, and threads arrive in change 03."),
+	}
+	lines := append(m.visual.header("fs-dash · PR details", pr.ID.Repo, m.width), m.visual.panel("Pull request", content, m.width)...)
 	if m.status != "" {
-		fmt.Fprintf(&out, "\n%s\n", m.status)
+		lines = append(lines, m.visual.paint(roleWarning, m.visual.fit(m.status, m.width)))
 	}
-	out.WriteString("\nesc back · o open · L logs · ? help · q quit\n")
-	return out.String()
+	lines = append(lines, m.visual.footer("esc back · o open · L logs · ? help · q quit", m.width))
+	return strings.Join(lines, "\n") + "\n"
 }
+
 func (m Model) helpView() string {
 	keys := make([]string, 0, len(m.opts.Config.Bindings))
 	for key := range m.opts.Config.Bindings {
 		keys = append(keys, key)
 	}
 	sort.Strings(keys)
-	var out strings.Builder
-	out.WriteString("fs-dash help\n\n j/k or arrows  move selection\n enter          PR details\n esc            back\n r              refresh all sections\n L              log console\n ?              toggle help\n q              quit\n")
+	content := []string{"j/k or arrows  move selection", "enter          PR details", "esc            back", "r              refresh all sections", "L              log console", "?              toggle help", "q              quit"}
 	for _, key := range keys {
-		fmt.Fprintf(&out, " %s              %s\n", key, m.opts.Config.Bindings[key].Executable)
+		content = append(content, fmt.Sprintf("%s              %s", key, m.opts.Config.Bindings[key].Executable))
 	}
-	out.WriteString("\nLog console: 0 all, 1 debug, 2 info, 3 warn, 4 error; j/k scroll; L close.\n")
-	return out.String()
+	content = append(content, "", "Log console: 0 all, 1 debug, 2 info, 3 warn, 4 error; j/k scroll; L close.")
+	lines := append(m.visual.header("fs-dash · Help", "Keyboard shortcuts", m.width), m.visual.panel("Navigation", content, m.width)...)
+	return strings.Join(lines, "\n") + "\n"
 }
+
 func (m Model) consoleView() string {
 	events := m.opts.Logs.Snapshot()
 	filtered := make([]ports.LogEvent, 0, len(events))
@@ -589,16 +630,20 @@ func (m Model) consoleView() string {
 			filtered = append(filtered, event)
 		}
 	}
-	visible := max(1, m.height-4)
+	panelOverhead := 2
+	visible := max(1, m.height-panelOverhead-2)
 	start := max(0, len(filtered)-visible-m.logOffset)
 	end := min(len(filtered), start+visible)
-	var out strings.Builder
-	fmt.Fprintf(&out, "fs-dash · logs · %s · %d events\n\n", m.logLevel, len(filtered))
+	content := make([]string, 0, max(0, end-start))
 	for _, event := range filtered[start:end] {
-		line := fmt.Sprintf("%s %-5s %s %s attempt=%d %s", event.Time.Local().Format("15:04:05"), event.Level, event.Operation, event.Item, event.Attempt, event.Message)
-		out.WriteString(runewidth.Truncate(line, max(20, m.width), "…"))
-		out.WriteByte('\n')
+		label := fmt.Sprintf("%-5s", strings.ToUpper(event.Level))
+		line := m.visual.paint(roleMuted, event.Time.Local().Format("15:04:05")) + " " + m.visual.paint(logRole(event.Level), label) + " " + m.visual.paint(roleNeutral, fmt.Sprintf("%s %s attempt=%d %s", event.Operation, event.Item, event.Attempt, event.Message))
+		content = append(content, line)
 	}
-	out.WriteString("\n0 all · 1 debug · 2 info · 3 warn · 4 error · j/k scroll · L close\n")
-	return out.String()
+	if len(content) == 0 {
+		content = []string{m.visual.paint(roleMuted, "No log events for this level.")}
+	}
+	lines := m.visual.panel(fmt.Sprintf("fs-dash · Logs · %s · %d events", strings.ToUpper(m.logLevel), len(filtered)), content, m.width)
+	lines = append(lines, m.visual.footer("0 all · 1 debug · 2 info · 3 warn · 4 error · j/k scroll · L close", m.width))
+	return strings.Join(lines, "\n") + "\n"
 }
