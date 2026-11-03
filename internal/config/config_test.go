@@ -70,6 +70,16 @@ func TestBindingKeepsURLAsSingleArgument(t *testing.T) {
 	}
 }
 
+func TestTriageHotkeysAreReservedFromCustomBindings(t *testing.T) {
+	for _, key := range []string{"f", "s", "z", "S", "u"} {
+		cfg := Default()
+		cfg.Bindings[key] = Binding{Executable: "custom"}
+		if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), key) {
+			t.Errorf("binding %q was not rejected: %v", key, err)
+		}
+	}
+}
+
 func TestRemoteDetection(t *testing.T) {
 	for _, remote := range []string{"git@github.com:owner/repo.git", "https://github.com/owner/repo.git"} {
 		if got := ParseGitHubRemote(remote); got != "owner/repo" {

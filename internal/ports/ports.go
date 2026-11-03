@@ -8,7 +8,7 @@ import (
 )
 
 type PRLister interface {
-	ListOpenPRs(ctx context.Context, repository string) ([]domain.PR, error)
+	ListOpenPRs(ctx context.Context, repository string) (domain.PRList, error)
 }
 
 type Enricher interface {

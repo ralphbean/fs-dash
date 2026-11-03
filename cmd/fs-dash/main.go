@@ -9,6 +9,7 @@ import (
 	"github.com/fullsend-ai/fs-dash/internal/config"
 	"github.com/fullsend-ai/fs-dash/internal/github"
 	"github.com/fullsend-ai/fs-dash/internal/localcmd"
+	"github.com/fullsend-ai/fs-dash/internal/reminder"
 	"github.com/fullsend-ai/fs-dash/internal/ui"
 )
 
@@ -50,7 +51,17 @@ func main() {
 		fmt.Fprintln(os.Stderr, "fs-dash:", err)
 		os.Exit(2)
 	}
-	options := ui.Options{Config: cfg, Repos: repos, Lister: github.PRLister{}, Runner: localcmd.Runner{}}
+	reminderPath, reminderErr := reminder.DefaultPath()
+	var reminderStore *reminder.FileStore
+	if reminderErr == nil {
+		reminderStore = reminder.NewFileStore(reminderPath)
+		reminderErr = reminderStore.Load()
+	}
+	var store reminder.Store = reminder.NewMemoryStore()
+	if reminderStore != nil {
+		store = reminderStore
+	}
+	options := ui.Options{Config: cfg, Repos: repos, Lister: github.PRLister{}, Enricher: github.Enricher{}, Runner: localcmd.Runner{}, Reminders: store, ReminderLoadError: reminderErr}
 	if _, err := tea.NewProgram(ui.New(options)).Run(); err != nil {
 		fmt.Fprintln(os.Stderr, "fs-dash:", err)
 		os.Exit(1)

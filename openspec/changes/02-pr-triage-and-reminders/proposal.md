@@ -6,6 +6,7 @@ A plain PR list still leaves the developer deciding where to look first. This sl
 
 - Add review, assignment, and ownership filters plus prioritized PR slices.
 - Add a second section for PRs with evidence that a remote Fullsend agent is currently working, with explicit unknown and stale states.
+- Prefetch activity for every listed PR after each list load with at most five requests in flight, preserving list order and prioritizing the PR the user selects.
 - Derive review and bot approval signals from underlying review data.
 - Add local stars and time-based snoozes, with automatic reappearance and persistence.
 

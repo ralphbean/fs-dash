@@ -15,9 +15,10 @@ import (
 )
 
 const listQuery = `query($owner: String!, $name: String!, $endCursor: String) {
+  viewer { login }
   repository(owner: $owner, name: $name) {
     pullRequests(first: 100, after: $endCursor, states: OPEN, orderBy: {field: UPDATED_AT, direction: DESC}) {
-      nodes { number title url updatedAt headRefOid author { login } }
+      nodes { number title url updatedAt headRefOid author { login } assignees(first: 20) { nodes { login } pageInfo { hasNextPage } } }
       pageInfo { hasNextPage endCursor }
     }
   }
@@ -25,6 +26,9 @@ const listQuery = `query($owner: String!, $name: String!, $endCursor: String) {
 
 type page struct {
 	Data struct {
+		Viewer struct {
+			Login string `json:"login"`
+		} `json:"viewer"`
 		Repository *struct {
 			PullRequests struct {
 				Nodes []struct {
@@ -36,6 +40,14 @@ type page struct {
 					Author    *struct {
 						Login string `json:"login"`
 					} `json:"author"`
+					Assignees *struct {
+						Nodes []struct {
+							Login string `json:"login"`
+						} `json:"nodes"`
+						PageInfo struct {
+							HasNextPage bool `json:"hasNextPage"`
+						} `json:"pageInfo"`
+					} `json:"assignees"`
 				} `json:"nodes"`
 				PageInfo struct {
 					HasNextPage bool   `json:"hasNextPage"`
@@ -51,10 +63,10 @@ type page struct {
 
 type PRLister struct{ CLI string }
 
-func (l PRLister) ListOpenPRs(ctx context.Context, repository string) ([]domain.PR, error) {
+func (l PRLister) ListOpenPRs(ctx context.Context, repository string) (domain.PRList, error) {
 	parts := strings.Split(repository, "/")
 	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
-		return nil, &domain.FetchError{Kind: domain.ErrorPermanent, Message: "repository must be owner/name"}
+		return domain.PRList{}, &domain.FetchError{Kind: domain.ErrorPermanent, Message: "repository must be owner/name"}
 	}
 	cli := l.CLI
 	if cli == "" {
@@ -67,39 +79,50 @@ func (l PRLister) ListOpenPRs(ctx context.Context, repository string) ([]domain.
 		if issue.Kind == domain.ErrorRateLimit {
 			issue.RetryAt = rateLimitReset(ctx, cli)
 		}
-		return nil, issue
+		return domain.PRList{}, issue
 	}
 	var pages []page
 	if err := json.Unmarshal(output, &pages); err != nil {
-		return nil, &domain.FetchError{Kind: domain.ErrorTransient, Message: "GitHub returned unreadable PR data"}
+		return domain.PRList{}, &domain.FetchError{Kind: domain.ErrorTransient, Message: "GitHub returned unreadable PR data"}
 	}
 	if len(pages) == 0 {
-		return nil, &domain.FetchError{Kind: domain.ErrorTransient, Message: "GitHub returned no PR pages"}
+		return domain.PRList{}, &domain.FetchError{Kind: domain.ErrorTransient, Message: "GitHub returned no PR pages"}
 	}
 	prs := make([]domain.PR, 0)
+	viewerLogin := ""
 	for _, p := range pages {
+		if p.Data.Viewer.Login != "" {
+			viewerLogin = p.Data.Viewer.Login
+		}
 		if len(p.Errors) > 0 {
 			issue := classifyCLIError(errors.New("GraphQL error"), p.Errors[0].Message)
 			if issue.Kind == domain.ErrorRateLimit {
 				issue.RetryAt = rateLimitReset(ctx, cli)
 			}
-			return nil, issue
+			return domain.PRList{}, issue
 		}
 		if p.Data.Repository == nil {
-			return nil, &domain.FetchError{Kind: domain.ErrorPermission, Message: "GitHub repository unavailable or access denied: " + repository}
+			return domain.PRList{}, &domain.FetchError{Kind: domain.ErrorPermission, Message: "GitHub repository unavailable or access denied: " + repository}
 		}
 		for _, node := range p.Data.Repository.PullRequests.Nodes {
 			author := "[deleted]"
 			if node.Author != nil {
 				author = node.Author.Login
 			}
-			prs = append(prs, domain.PR{ID: domain.ItemID{Source: "github", Host: "github.com", Repo: repository, Number: node.Number}, Title: node.Title, URL: node.URL, UpdatedAt: node.UpdatedAt, HeadSHA: node.HeadSHA, Author: author})
+			assignees := domain.AssigneeSet{}
+			if node.Assignees != nil {
+				for _, assignee := range node.Assignees.Nodes {
+					assignees.Logins = append(assignees.Logins, assignee.Login)
+				}
+				assignees.Complete = !node.Assignees.PageInfo.HasNextPage
+			}
+			prs = append(prs, domain.PR{ID: domain.ItemID{Source: "github", Host: "github.com", Repo: repository, Number: node.Number}, Title: node.Title, URL: node.URL, UpdatedAt: node.UpdatedAt, HeadSHA: node.HeadSHA, Author: author, Assignees: assignees})
 		}
 	}
 	if pages[len(pages)-1].Data.Repository.PullRequests.PageInfo.HasNextPage {
-		return nil, &domain.FetchError{Kind: domain.ErrorTransient, Message: "GitHub PR pagination incomplete"}
+		return domain.PRList{}, &domain.FetchError{Kind: domain.ErrorTransient, Message: "GitHub PR pagination incomplete"}
 	}
-	return prs, nil
+	return domain.PRList{PullRequests: prs, ViewerLogin: viewerLogin}, nil
 }
 
 var secretPattern = regexp.MustCompile(`(?i)(gh[opusr]_[a-z0-9]+|github_pat_[a-z0-9_]+|authorization:\s*\S+)`)

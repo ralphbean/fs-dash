@@ -2,6 +2,8 @@ package domain
 
 import (
 	"fmt"
+	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -24,6 +26,17 @@ type PR struct {
 	UpdatedAt time.Time
 	URL       string
 	HeadSHA   string
+	Assignees AssigneeSet
+}
+
+type PRList struct {
+	PullRequests []PR
+	ViewerLogin  string
+}
+
+type AssigneeSet struct {
+	Logins   []string
+	Complete bool
 }
 
 type FieldKey struct {
@@ -169,6 +182,50 @@ type Review struct {
 	ID     string
 }
 
+type ReviewSet struct {
+	Reviews     []Review
+	Complete    bool
+	ViewerLogin string
+}
+
+type LoginSet struct {
+	Logins      []string
+	Complete    bool
+	ViewerLogin string
+}
+
+type CheckSummary struct {
+	Failed   int
+	Pending  int
+	Total    int
+	Complete bool
+}
+
+type ThreadSummary struct {
+	Unresolved int
+	Complete   bool
+}
+
+type ActivityState string
+
+const (
+	ActivityUnknown  ActivityState = "unknown"
+	ActivityActive   ActivityState = "active"
+	ActivityStale    ActivityState = "stale"
+	ActivityInactive ActivityState = "inactive"
+)
+
+type ActivityEvidence struct {
+	State      ActivityState
+	URL        string
+	Author     string
+	RunID      string
+	StartedAt  time.Time
+	FetchedAt  time.Time
+	FreshUntil time.Time
+	Complete   bool
+}
+
 type Dependency struct {
 	Name    string
 	Version string
@@ -206,21 +263,47 @@ func sameDependencies(a, b []Dependency) bool {
 	return true
 }
 
-// BotApproval is definitive only when the complete current review set is known.
-func BotApproval(reviews []Review, complete bool, version string) DerivedBool {
-	out := DerivedBool{Dependencies: []Dependency{{Name: "reviews", Version: version}}}
+// EffectiveReviews keeps only the latest review by each reviewer. A partial
+// history cannot establish effective state because an omitted review may be newer.
+func EffectiveReviews(reviews []Review, complete bool, version string) ([]Review, bool) {
 	if !complete || version == "" {
-		return out
+		return nil, false
 	}
 	latest := map[string]Review{}
 	for _, review := range reviews {
 		key := strings.ToLower(review.Author)
-		if prev, ok := latest[key]; !ok || review.At.After(prev.At) || (review.At.Equal(prev.At) && review.ID > prev.ID) {
+		if prev, ok := latest[key]; !ok || review.At.After(prev.At) || (review.At.Equal(prev.At) && reviewIDGreater(review.ID, prev.ID)) {
 			latest[key] = review
 		}
 	}
-	out.Known = true
+	effective := make([]Review, 0, len(latest))
 	for _, review := range latest {
+		effective = append(effective, review)
+	}
+	sort.Slice(effective, func(i, j int) bool {
+		return strings.ToLower(effective[i].Author) < strings.ToLower(effective[j].Author)
+	})
+	return effective, true
+}
+
+func reviewIDGreater(a, b string) bool {
+	ai, aErr := strconv.ParseInt(a, 10, 64)
+	bi, bErr := strconv.ParseInt(b, 10, 64)
+	if aErr == nil && bErr == nil {
+		return ai > bi
+	}
+	return a > b
+}
+
+// BotApproval is definitive only when the complete current review set is known.
+func BotApproval(reviews []Review, complete bool, version string) DerivedBool {
+	out := DerivedBool{Dependencies: []Dependency{{Name: "reviews", Version: version}}}
+	effective, known := EffectiveReviews(reviews, complete, version)
+	if !known {
+		return out
+	}
+	out.Known = true
+	for _, review := range effective {
 		if review.IsBot && strings.EqualFold(review.State, "APPROVED") {
 			out.Value = true
 			break

@@ -3,6 +3,8 @@ package ui
 import (
 	"context"
 	"errors"
+	"fmt"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -11,16 +13,18 @@ import (
 	"github.com/fullsend-ai/fs-dash/internal/config"
 	"github.com/fullsend-ai/fs-dash/internal/diag"
 	"github.com/fullsend-ai/fs-dash/internal/domain"
+	"github.com/fullsend-ai/fs-dash/internal/reminder"
 	"github.com/fullsend-ai/fs-dash/internal/testutil"
+	"github.com/fullsend-ai/fs-dash/internal/triage"
 )
 
 func TestFailedSectionSettlesWithoutBlockingOtherSection(t *testing.T) {
 	logs := diag.New(20)
-	lister := testutil.PRLister{Fn: func(_ context.Context, repo string) ([]domain.PR, error) {
+	lister := testutil.PRLister{Fn: func(_ context.Context, repo string) (domain.PRList, error) {
 		if repo == "one/repo" {
-			return nil, &domain.FetchError{Kind: domain.ErrorTransient, Message: "502 Bad Gateway"}
+			return domain.PRList{}, &domain.FetchError{Kind: domain.ErrorTransient, Message: "502 Bad Gateway"}
 		}
-		return []domain.PR{{ID: domain.ItemID{Source: "github", Host: "github.com", Repo: repo, Number: 2}, Title: "Ready", URL: "https://github.com/two/repo/pull/2"}}, nil
+		return domain.PRList{PullRequests: []domain.PR{{ID: domain.ItemID{Source: "github", Host: "github.com", Repo: repo, Number: 2}, Title: "Ready", URL: "https://github.com/two/repo/pull/2"}}}, nil
 	}}
 	m := New(Options{Config: config.Default(), Repos: []string{"one/repo", "two/repo"}, Lister: lister, Logs: logs})
 	failed := m.fetchList("one/repo", m.sections[0].field.Generation, 1)()
@@ -47,7 +51,7 @@ func TestFailedSectionSettlesWithoutBlockingOtherSection(t *testing.T) {
 }
 
 func TestSelectionSurvivesReorderedRows(t *testing.T) {
-	m := New(Options{Config: config.Default(), Repos: []string{"one/repo"}, Lister: testutil.PRLister{Fn: func(context.Context, string) ([]domain.PR, error) { return nil, errors.New("unused") }}})
+	m := New(Options{Config: config.Default(), Repos: []string{"one/repo"}, Lister: testutil.PRLister{Fn: func(context.Context, string) (domain.PRList, error) { return domain.PRList{}, errors.New("unused") }}})
 	id := domain.ItemID{Source: "github", Host: "github.com", Repo: "one/repo", Number: 2}
 	prs := []domain.PR{{ID: domain.ItemID{Source: "github", Host: "github.com", Repo: "one/repo", Number: 1}, Title: "one"}, {ID: id, Title: "two"}}
 	next, _ := m.Update(listMsg{repo: "one/repo", generation: m.sections[0].field.Generation, value: prs, at: time.Now()})
@@ -79,16 +83,16 @@ func TestListViewUsesTerminalHeight(t *testing.T) {
 	}
 }
 
-func TestSelectedFieldFailureSettlesIndependently(t *testing.T) {
+func TestSelectedTriageFieldsFailIndependently(t *testing.T) {
 	id := domain.ItemID{Source: "github", Host: "github.com", Repo: "one/repo", Number: 1}
 	m := New(Options{Config: config.Default(), Repos: []string{"one/repo"}, Enricher: testutil.Enricher{Fn: func(context.Context, domain.FieldKey) (any, domain.Provenance, error) {
 		return nil, domain.Provenance{}, &domain.FetchError{Kind: domain.ErrorTransient, Message: "enrichment failed"}
 	}}})
 	next, _ := m.Update(listMsg{repo: "one/repo", generation: m.sections[0].field.Generation, value: []domain.PR{{ID: id, Title: "PR", HeadSHA: "abc"}}, at: time.Now()})
 	m = next.(Model)
-	key := domain.FieldKey{Item: id, Name: "review_summary", Revision: "abc"}
+	key := domain.FieldKey{Item: id, Name: "activity", Revision: "abc"}
 	if m.fields[key] == nil || !m.fields[key].Phase.Active() {
-		t.Fatal("selected field not requested")
+		t.Fatal("selected activity field not requested")
 	}
 	msg := m.fetchField(key, m.fields[key].Generation, 1)()
 	next, _ = m.Update(msg)
@@ -126,4 +130,211 @@ func TestHotkeyRunsSelectedURLCommand(t *testing.T) {
 	if len(got) != 1 || len(got[0].Args) != 1 || got[0].Args[0] != pr.URL {
 		t.Fatalf("wrong command: %+v", got)
 	}
+}
+
+func TestReviewFilterIncludesIncompleteRowsAsPending(t *testing.T) {
+	now := time.Now()
+	prs := []domain.PR{testUIPr(1, now), testUIPr(2, now), testUIPr(3, now)}
+	m := loadedModel(t, prs)
+	m.viewer = "me"
+	putField(&m, prs[0], "review_requests", domain.LoginSet{Logins: []string{"someone-else"}, Complete: true, ViewerLogin: "me"}, now)
+	putField(&m, prs[1], "review_requests", domain.LoginSet{Logins: []string{"me"}, Complete: true, ViewerLogin: "me"}, now)
+	m.filter = triage.FilterReviewRequested
+	m.ensureSelection()
+	sections := m.projection()
+	if len(sections.Review) != 2 || sections.Review[0].PR.ID.Number != 2 || sections.Review[1].PR.ID.Number != 3 || !sections.Review[1].FilterPending {
+		t.Fatalf("review filter rows = %+v", sections.Review)
+	}
+	view := m.View()
+	if !strings.Contains(view, "REVIEW REQUESTED FROM ME") || !strings.Contains(view, "filter pending") {
+		t.Fatalf("filter or pending state missing: %s", view)
+	}
+}
+
+func TestActivitySectionAndSelectionSurviveRankingUpdate(t *testing.T) {
+	now := time.Now()
+	prs := []domain.PR{testUIPr(1, now), testUIPr(2, now)}
+	m := loadedModel(t, prs)
+	selected := m.selected
+	key := domain.FieldKey{Item: prs[1].ID, Name: "checks", Revision: prs[1].HeadSHA}
+	f := domain.NewField[any]()
+	generation := f.Queue()
+	f.Begin(generation)
+	m.fields[key] = &f
+	next, _ := m.Update(fieldMsg{key: key, generation: generation, value: domain.CheckSummary{Failed: 1, Complete: true}, provenance: domain.Provenance{Source: "github", Version: "checks-v1", FetchedAt: now, FreshUntil: now.Add(time.Hour)}, at: now})
+	m = next.(Model)
+	if m.selected != selected {
+		t.Fatalf("selection changed after ranking update: got %v, want %v", m.selected, selected)
+	}
+	rows := m.allRows()
+	if rows[0].ID.Number != 2 || m.selected.Number != 1 {
+		t.Fatalf("rank did not update while preserving selection: rows=%v selected=%v", []int{rows[0].ID.Number, rows[1].ID.Number}, m.selected)
+	}
+	active := domain.ActivityEvidence{State: domain.ActivityActive, Author: "fullsend-ai-coder", RunID: "run-3", StartedAt: now, URL: "https://github.com/owner/repo/pull/1#issuecomment-3", FetchedAt: now, FreshUntil: now.Add(time.Hour), Complete: true}
+	putField(&m, prs[0], "activity", active, now)
+	sections := m.projection()
+	if len(sections.Active) != 1 || sections.Active[0].PR.ID.Number != 1 || len(sections.Review) != 1 || sections.Review[0].PR.ID.Number != 2 {
+		t.Fatalf("active-agent section = %+v; review = %+v", sections.Active, sections.Review)
+	}
+	m.selected = prs[0].ID
+	m.ensureSelection()
+	if view := m.View(); !strings.Contains(view, "ACTIVE FULLSEND AGENTS") || !strings.Contains(view, active.URL) {
+		t.Fatalf("active evidence absent from view: %s", view)
+	}
+}
+
+func TestStarSnoozeHiddenViewAndManualUnsnooze(t *testing.T) {
+	now := time.Now()
+	pr := testUIPr(8, now)
+	m := loadedModel(t, []domain.PR{pr})
+	runner := &testutil.Runner{}
+	m.opts.Runner = runner
+	m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'s'}})
+	if !m.opts.Reminders.Snapshot()[pr.ID].Starred {
+		t.Fatal("star was not persisted to local store")
+	}
+	next, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'z'}})
+	m = next.(Model)
+	if m.mode != "snooze" {
+		t.Fatal("snooze duration prompt did not open")
+	}
+	next, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'2'}})
+	m = next.(Model)
+	entry := m.opts.Reminders.Snapshot()[pr.ID]
+	if !entry.Starred || entry.SnoozedUntil.Sub(now) < 23*time.Hour {
+		t.Fatalf("star or one-day snooze was not retained: %+v", entry)
+	}
+	if len(m.allRows()) != 0 {
+		t.Fatal("snoozed PR remained in the normal view")
+	}
+	next, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'S'}})
+	m = next.(Model)
+	if !strings.Contains(m.View(), "SNOOZED") || !strings.Contains(m.View(), "★ starred") {
+		t.Fatalf("hidden snoozed item is not inspectable: %s", m.View())
+	}
+	next, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'u'}})
+	m = next.(Model)
+	if !m.opts.Reminders.Snapshot()[pr.ID].SnoozedUntil.IsZero() {
+		t.Fatal("manual unsnooze did not clear wake time")
+	}
+	next, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'S'}})
+	m = next.(Model)
+	if len(m.allRows()) != 1 || m.allRows()[0].ID != pr.ID {
+		t.Fatal("unsnoozed PR did not return to normal view")
+	}
+	if got := runner.Snapshot(); len(got) != 0 {
+		t.Fatalf("local reminder actions launched remote-related commands: %+v", got)
+	}
+}
+
+func TestSnoozeWakeUsesInjectedClock(t *testing.T) {
+	now := time.Date(2026, 11, 3, 15, 0, 0, 0, time.UTC)
+	clock := &testClock{now: now}
+	pr := testUIPr(5, now)
+	store := reminder.NewMemoryStore()
+	if err := store.Snooze(pr.ID, now.Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	m := New(Options{Config: config.Default(), Repos: []string{"owner/repo"}, Clock: clock, Reminders: store})
+	m.sections[0].field.Succeed(m.sections[0].field.Generation, []domain.PR{pr}, domain.Provenance{Version: "list-v1", FreshUntil: now.Add(time.Hour)})
+	next, _ := m.Update(tea.WindowSizeMsg{Width: 80, Height: 24})
+	m = next.(Model)
+	if !m.wakeTickRunning {
+		t.Fatal("no wake timer scheduled")
+	}
+	clock.now = now.Add(2 * time.Hour)
+	next, _ = m.Update(wakeMsg{generation: m.wakeGeneration})
+	m = next.(Model)
+	if len(m.allRows()) != 1 || m.allRows()[0].ID != pr.ID {
+		t.Fatal("expired snooze did not automatically reappear")
+	}
+}
+
+func TestExpiredSnoozeIsVisibleAfterReload(t *testing.T) {
+	now := time.Date(2026, 11, 3, 15, 0, 0, 0, time.UTC)
+	path := filepath.Join(t.TempDir(), "reminders.json")
+	pr := testUIPr(6, now)
+	first := reminder.NewFileStore(path)
+	if err := first.Load(); err != nil {
+		t.Fatal(err)
+	}
+	if err := first.Snooze(pr.ID, now.Add(-time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	reloaded := reminder.NewFileStore(path)
+	if err := reloaded.Load(); err != nil {
+		t.Fatal(err)
+	}
+	m := New(Options{Config: config.Default(), Repos: []string{"owner/repo"}, Clock: &testClock{now: now}, Reminders: reloaded})
+	m.sections[0].field.Succeed(m.sections[0].field.Generation, []domain.PR{pr}, domain.Provenance{Version: "list-v1", FreshUntil: now.Add(time.Hour)})
+	if rows := m.allRows(); len(rows) != 1 || rows[0].ID != pr.ID {
+		t.Fatalf("expired snooze did not reappear after reload: %+v", rows)
+	}
+	if hidden := m.projection(); len(hidden.Snoozed) != 0 {
+		t.Fatalf("expired PR remained in snoozed view: %+v", hidden.Snoozed)
+	}
+}
+
+func TestReminderLoadWarningSurvivesListSuccess(t *testing.T) {
+	warning := errors.New("invalid JSON; backup retained")
+	m := New(Options{Config: config.Default(), Repos: []string{"owner/repo"}, ReminderLoadError: warning})
+	pr := testUIPr(2, time.Now())
+	next, _ := m.Update(listMsg{repo: "owner/repo", generation: m.sections[0].field.Generation, value: []domain.PR{pr}, at: time.Now()})
+	m = next.(Model)
+	if !strings.Contains(m.View(), "backup retained") {
+		t.Fatalf("reminder warning disappeared after list load: %s", m.View())
+	}
+}
+
+func TestActivityIndicatorsSeparatePendingInactiveStaleAndFailed(t *testing.T) {
+	now := time.Now()
+	pr := testUIPr(14, now)
+	m := loadedModel(t, []domain.PR{pr})
+	if got := m.rowStatus(m.projection().Review[0]); !strings.Contains(got, "activity pending") {
+		t.Fatalf("unrequested activity indicator = %q", got)
+	}
+	for _, tc := range []struct {
+		state domain.ActivityState
+		want  string
+	}{{domain.ActivityUnknown, "activity unknown"}, {domain.ActivityInactive, "agent inactive"}, {domain.ActivityStale, "agent status stale"}} {
+		putField(&m, pr, "activity", domain.ActivityEvidence{State: tc.state, StartedAt: now.Add(-7 * time.Hour)}, now)
+		row := m.projection().Review[0]
+		if got := m.rowStatus(row); !strings.Contains(got, tc.want) {
+			t.Errorf("%s indicator = %q, want %q", tc.state, got, tc.want)
+		}
+	}
+	key := domain.FieldKey{Item: pr.ID, Name: "activity", Revision: pr.HeadSHA}
+	f := domain.NewField[any]()
+	generation := f.Queue()
+	f.Begin(generation)
+	f.Fail(generation, &domain.FetchError{Kind: domain.ErrorPermanent, Message: "comment query failed"}, time.Time{})
+	m.fields[key] = &f
+	if got := m.rowStatus(m.projection().Review[0]); !strings.Contains(got, "activity failed") {
+		t.Fatalf("failed activity indicator = %q", got)
+	}
+}
+
+type testClock struct{ now time.Time }
+
+func (c *testClock) Now() time.Time { return c.now }
+
+func loadedModel(t *testing.T, prs []domain.PR) Model {
+	t.Helper()
+	repo := "owner/repo"
+	m := New(Options{Config: config.Default(), Repos: []string{repo}})
+	next, _ := m.Update(listMsg{repo: repo, generation: m.sections[0].field.Generation, value: prs, at: time.Now()})
+	return next.(Model)
+}
+
+func testUIPr(number int, updated time.Time) domain.PR {
+	return domain.PR{ID: domain.ItemID{Source: "github", Host: "github.com", Repo: "owner/repo", Number: number}, Title: "PR", Author: "contributor", UpdatedAt: updated, HeadSHA: fmt.Sprintf("head-%d", number), URL: fmt.Sprintf("https://github.com/owner/repo/pull/%d", number)}
+}
+
+func putField(m *Model, pr domain.PR, name string, value any, now time.Time) {
+	key := domain.FieldKey{Item: pr.ID, Name: name, Revision: pr.HeadSHA}
+	f := domain.NewField[any]()
+	generation := f.Queue()
+	f.Begin(generation)
+	f.Succeed(generation, value, domain.Provenance{Source: "github", Version: name + "-v1", FetchedAt: now, FreshUntil: now.Add(time.Hour)})
+	m.fields[key] = &f
 }

@@ -10,10 +10,10 @@ import (
 )
 
 type PRLister struct {
-	Fn func(context.Context, string) ([]domain.PR, error)
+	Fn func(context.Context, string) (domain.PRList, error)
 }
 
-func (f PRLister) ListOpenPRs(ctx context.Context, repo string) ([]domain.PR, error) {
+func (f PRLister) ListOpenPRs(ctx context.Context, repo string) (domain.PRList, error) {
 	return f.Fn(ctx, repo)
 }
 

@@ -65,15 +65,16 @@ func (s *Scheduler) Do(ctx context.Context, source, key string, fn func(context.
 		s.mu.Unlock()
 	}()
 
-	requestCtx, cancel := context.WithTimeout(ctx, s.timeout)
-	defer cancel()
+	// Time spent waiting for a source slot is queue time, not request time.
 	select {
 	case limit <- struct{}{}:
 		defer func() { <-limit }()
-	case <-requestCtx.Done():
-		pending.err = requestCtx.Err()
+	case <-ctx.Done():
+		pending.err = ctx.Err()
 		return nil, pending.err
 	}
+	requestCtx, cancel := context.WithTimeout(ctx, s.timeout)
+	defer cancel()
 	pending.value, pending.err = fn(requestCtx)
 	if pending.err == nil && requestCtx.Err() != nil {
 		pending.err = requestCtx.Err()

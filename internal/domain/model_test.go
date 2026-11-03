@@ -57,6 +57,32 @@ func TestBotApprovalNeedsCompleteCurrentReviews(t *testing.T) {
 	}
 }
 
+func TestEffectiveReviewsUsesNewestReviewPerReviewer(t *testing.T) {
+	now := time.Date(2026, 11, 3, 12, 0, 0, 0, time.UTC)
+	reviews := []Review{
+		{Author: "review[bot]", IsBot: true, State: "APPROVED", At: now, ID: "a"},
+		{Author: "REVIEW[bot]", IsBot: true, State: "DISMISSED", At: now.Add(time.Minute), ID: "b"},
+		{Author: "human", State: "CHANGES_REQUESTED", At: now, ID: "c"},
+		{Author: "other", State: "APPROVED", At: now, ID: "9"},
+		{Author: "other", State: "DISMISSED", At: now, ID: "10"},
+	}
+	if effective, known := EffectiveReviews(reviews, false, "v1"); known || effective != nil {
+		t.Fatalf("incomplete history became definitive: %+v known=%v", effective, known)
+	}
+	effective, known := EffectiveReviews(reviews, true, "v2")
+	if !known || len(effective) != 3 {
+		t.Fatalf("effective reviews = %+v, known=%v", effective, known)
+	}
+	if got := BotApproval(reviews, true, "v2"); !got.Known || got.Value {
+		t.Fatalf("newest bot dismissal should clear approval: %+v", got)
+	}
+	for _, review := range effective {
+		if review.Author == "other" && review.ID != "10" {
+			t.Fatalf("numeric review ID tie-break chose %q, want 10", review.ID)
+		}
+	}
+}
+
 func TestDerivationInvalidatesOnDependencyVersion(t *testing.T) {
 	var cache BoolDerivation
 	calls := 0

@@ -13,17 +13,22 @@ import (
 	"github.com/fullsend-ai/fs-dash/internal/domain"
 	"github.com/fullsend-ai/fs-dash/internal/fetch"
 	"github.com/fullsend-ai/fs-dash/internal/ports"
+	"github.com/fullsend-ai/fs-dash/internal/reminder"
+	"github.com/fullsend-ai/fs-dash/internal/triage"
 )
 
 type Options struct {
-	Config    config.Config
-	Repos     []string
-	Lister    ports.PRLister
-	Enricher  ports.Enricher
-	Scheduler *fetch.Scheduler
-	Runner    ports.CommandRunner
-	Logs      *diag.Buffer
-	Clock     ports.Clock
+	Config            config.Config
+	Repos             []string
+	Lister            ports.PRLister
+	Enricher          ports.Enricher
+	Scheduler         *fetch.Scheduler
+	ActivityScheduler *fetch.Scheduler
+	Runner            ports.CommandRunner
+	Logs              *diag.Buffer
+	Clock             ports.Clock
+	Reminders         reminder.Store
+	ReminderLoadError error
 }
 type realClock struct{}
 
@@ -45,14 +50,28 @@ type Model struct {
 	logOffset, width, height, frame int
 	tickRunning                     bool
 	status                          string
+	reminderWarning                 string
 	fields                          map[domain.FieldKey]*domain.Field[any]
 	fieldAttempts                   map[domain.FieldKey]int
+	fieldQueue                      []domain.FieldKey
+	fieldQueued                     map[domain.FieldKey]bool
+	fieldInFlight                   map[domain.FieldKey]uint64
+	filter                          triage.Filter
+	showSnoozed                     bool
+	viewer                          string
+	wakeTickRunning                 bool
+	wakeGeneration                  uint64
+	nextWake                        time.Time
+	activityQueue                   []domain.FieldKey
+	activityQueued                  map[domain.FieldKey]bool
+	activityInFlight                map[domain.FieldKey]uint64
 	visual                          visualTheme
 }
 type listMsg struct {
 	repo       string
 	generation uint64
 	value      []domain.PR
+	viewer     string
 	err        error
 	at         time.Time
 	attempt    int
@@ -76,6 +95,7 @@ type retryMsg struct {
 	generation uint64
 }
 type tickMsg time.Time
+type wakeMsg struct{ generation uint64 }
 type commandMsg struct {
 	key string
 	err error
@@ -96,14 +116,23 @@ func New(opts Options) Model {
 	if opts.Scheduler == nil {
 		opts.Scheduler = fetch.NewScheduler(2, 20*time.Second)
 	}
+	if opts.ActivityScheduler == nil {
+		opts.ActivityScheduler = fetch.NewScheduler(maxConcurrentActivityFetches, 20*time.Second)
+	}
 	if opts.Logs == nil {
 		opts.Logs = diag.New(opts.Config.LogLimit)
 	}
 	if opts.Clock == nil {
 		opts.Clock = realClock{}
 	}
-	m := Model{opts: opts, mode: "list", logLevel: "all", width: 100, height: 30, fields: map[domain.FieldKey]*domain.Field[any]{}, fieldAttempts: map[domain.FieldKey]int{}, visual: newVisualTheme(opts.Config)}
+	if opts.Reminders == nil {
+		opts.Reminders = reminder.NewMemoryStore()
+	}
+	m := Model{opts: opts, mode: "list", logLevel: "all", width: 100, height: 30, fields: map[domain.FieldKey]*domain.Field[any]{}, fieldAttempts: map[domain.FieldKey]int{}, fieldQueued: map[domain.FieldKey]bool{}, fieldInFlight: map[domain.FieldKey]uint64{}, activityQueued: map[domain.FieldKey]bool{}, activityInFlight: map[domain.FieldKey]uint64{}, filter: triage.FilterAssigned, visual: newVisualTheme(opts.Config)}
 	m.visual.compact = m.width < 64
+	if opts.ReminderLoadError != nil {
+		m.reminderWarning = "Local reminders: " + opts.ReminderLoadError.Error()
+	}
 	for _, repo := range opts.Repos {
 		f := domain.NewField[[]domain.PR]()
 		g := f.Queue()
@@ -131,16 +160,22 @@ func (m Model) fetchList(repo string, generation uint64, attempt int) tea.Cmd {
 		start := m.opts.Clock.Now()
 		value, err := m.opts.Scheduler.Do(context.Background(), "github", fmt.Sprintf("list:%s:%d", repo, generation), func(ctx context.Context) (any, error) { return m.opts.Lister.ListOpenPRs(ctx, repo) })
 		var prs []domain.PR
+		var viewer string
 		if value != nil {
-			prs = value.([]domain.PR)
+			result := value.(domain.PRList)
+			prs, viewer = result.PullRequests, result.ViewerLogin
 		}
 		at := m.opts.Clock.Now()
-		return listMsg{repo: repo, generation: generation, value: prs, err: err, at: at, attempt: attempt, duration: at.Sub(start)}
+		return listMsg{repo: repo, generation: generation, value: prs, viewer: viewer, err: err, at: at, attempt: attempt, duration: at.Sub(start)}
 	}
 }
 func (m Model) fetchField(key domain.FieldKey, generation uint64, attempt int) tea.Cmd {
 	return func() tea.Msg {
-		value, err := m.opts.Scheduler.Do(context.Background(), "github", fmt.Sprintf("%s:%d", key.String(), generation), func(ctx context.Context) (any, error) {
+		scheduler, source := m.opts.Scheduler, "github"
+		if key.Name == "activity" {
+			scheduler, source = m.opts.ActivityScheduler, "github-activity"
+		}
+		value, err := scheduler.Do(context.Background(), source, fmt.Sprintf("%s:%d", key.String(), generation), func(ctx context.Context) (any, error) {
 			v, p, e := m.opts.Enricher.FetchField(ctx, key)
 			return struct {
 				v any
@@ -166,13 +201,7 @@ func (m *Model) section(repo string) *section {
 	return nil
 }
 func (m Model) allRows() []domain.PR {
-	var rows []domain.PR
-	for _, s := range m.sections {
-		if s.field.HasValue {
-			rows = append(rows, s.field.Value...)
-		}
-	}
-	return rows
+	return m.projectedRows()
 }
 func (m *Model) ensureSelection() {
 	rows := m.allRows()
@@ -232,28 +261,20 @@ func (m *Model) maybeTick(cmds *[]tea.Cmd) {
 		*cmds = append(*cmds, spinnerTick())
 	}
 }
-func (m *Model) selectedField(force bool) tea.Cmd {
-	if m.opts.Enricher == nil {
-		return nil
+func (m *Model) applySnooze(duration time.Duration) {
+	if !m.hasSelection {
+		m.mode = "list"
+		return
 	}
-	pr, ok := m.selectedPR()
-	if !ok {
-		return nil
+	until := m.opts.Clock.Now().Add(duration)
+	if err := m.opts.Reminders.Snooze(m.selected, until); err != nil {
+		m.status = "Snooze failed: " + err.Error()
+	} else {
+		m.status = "PR snoozed until " + until.Local().Format("Jan 02 15:04")
 	}
-	key := domain.FieldKey{Item: pr.ID, Name: "review_summary", Revision: pr.HeadSHA}
-	f := m.fields[key]
-	if f != nil && !force && (f.Phase == domain.Cooldown || f.Phase.Active() || (f.Phase == domain.Ready && !f.Stale(m.opts.Clock.Now()))) {
-		return nil
-	}
-	if f == nil {
-		fresh := domain.NewField[any]()
-		f = &fresh
-		m.fields[key] = f
-	}
-	g := f.Queue()
-	f.Begin(g)
-	m.fieldAttempts[key] = 1
-	return m.fetchField(key, g, 1)
+	m.mode = "list"
+	m.showSnoozed = false
+	m.ensureSelection()
 }
 func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 	var cmds []tea.Cmd
@@ -264,6 +285,12 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 	case tickMsg:
 		m.tickRunning = false
 		m.frame = (m.frame + 1) % len(frames)
+	case wakeMsg:
+		if msg.generation == m.wakeGeneration {
+			m.wakeTickRunning = false
+			m.nextWake = time.Time{}
+			m.ensureSelection()
+		}
 	case listMsg:
 		s := m.section(msg.repo)
 		if s == nil || s.field.Generation != msg.generation {
@@ -288,10 +315,12 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			s.attempts = 0
 			m.log("info", "list-open-prs", msg.repo, msg.attempt, msg.duration, fmt.Sprintf("loaded %d open PRs", len(msg.value)))
 			m.status = fmt.Sprintf("%s: %d open PRs", msg.repo, len(msg.value))
-			m.ensureSelection()
-			if cmd := m.selectedField(false); cmd != nil {
-				cmds = append(cmds, cmd)
+			if msg.viewer != "" {
+				m.viewer = msg.viewer
 			}
+			m.ensureSelection()
+			m.enqueueListActivity(msg.value)
+			cmds = append(cmds, m.selectedFields(false)...)
 		}
 	case retryMsg:
 		s := m.section(msg.repo)
@@ -303,6 +332,14 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			m.log("info", "retry-list", s.repo, s.attempts, 0, "retrying after cooldown")
 		}
 	case fieldMsg:
+		if msg.key.Name != "activity" && m.fieldInFlight[msg.key] == msg.generation {
+			delete(m.fieldInFlight, msg.key)
+			cmds = append(cmds, m.startFieldFetches()...)
+		}
+		if msg.key.Name == "activity" && m.activityInFlight[msg.key] == msg.generation {
+			delete(m.activityInFlight, msg.key)
+			cmds = append(cmds, m.startActivityFetches()...)
+		}
 		f := m.fields[msg.key]
 		if f == nil || f.Generation != msg.generation {
 			break
@@ -318,14 +355,36 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		} else {
 			f.Succeed(msg.generation, msg.value, msg.provenance)
 			m.fieldAttempts[msg.key] = 0
+			switch value := msg.value.(type) {
+			case domain.ReviewSet:
+				if value.ViewerLogin != "" {
+					m.viewer = value.ViewerLogin
+				}
+			case domain.LoginSet:
+				if value.ViewerLogin != "" {
+					m.viewer = value.ViewerLogin
+				}
+			}
+			previousSelection, previouslyHadSelection := m.selected, m.hasSelection
+			m.ensureSelection()
+			if m.selected != previousSelection || m.hasSelection != previouslyHadSelection {
+				if selected, ok := m.selectedPR(); ok {
+					m.discardQueuedFieldsExcept(selected.ID, selected.HeadSHA)
+				} else {
+					m.discardQueuedFieldsExcept(domain.ItemID{}, "")
+				}
+			}
 		}
 	case fieldRetryMsg:
 		f := m.fields[msg.key]
 		if f != nil && f.Generation == msg.generation && f.Phase == domain.Cooldown && !m.opts.Clock.Now().Before(f.RetryAt) {
-			g := f.Queue()
-			f.Begin(g)
-			m.fieldAttempts[msg.key]++
-			cmds = append(cmds, m.fetchField(msg.key, g, m.fieldAttempts[msg.key]))
+			if msg.key.Name == "activity" {
+				m.queueActivity(msg.key, true, false)
+				cmds = append(cmds, m.startActivityFetches()...)
+			} else {
+				m.queueField(msg.key, true)
+				cmds = append(cmds, m.startFieldFetches()...)
+			}
 		}
 	case commandMsg:
 		if msg.err != nil {
@@ -386,6 +445,19 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		if key == "q" {
 			return m, tea.Quit
 		}
+		if m.mode == "snooze" {
+			switch key {
+			case "esc":
+				m.mode = "list"
+			case "1":
+				m.applySnooze(time.Hour)
+			case "2":
+				m.applySnooze(24 * time.Hour)
+			case "3":
+				m.applySnooze(7 * 24 * time.Hour)
+			}
+			break
+		}
 		if m.mode == "details" && key == "esc" {
 			m.mode = "list"
 			break
@@ -394,16 +466,12 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		case "j", "down":
 			if m.mode == "list" {
 				m.move(1)
-				if cmd := m.selectedField(false); cmd != nil {
-					cmds = append(cmds, cmd)
-				}
+				cmds = append(cmds, m.selectedFields(false)...)
 			}
 		case "k", "up":
 			if m.mode == "list" {
 				m.move(-1)
-				if cmd := m.selectedField(false); cmd != nil {
-					cmds = append(cmds, cmd)
-				}
+				cmds = append(cmds, m.selectedFields(false)...)
 			}
 		case "enter":
 			if m.hasSelection {
@@ -417,8 +485,37 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 				s.attempts = 1
 				cmds = append(cmds, m.fetchList(s.repo, g, 1))
 			}
-			if cmd := m.selectedField(true); cmd != nil {
-				cmds = append(cmds, cmd)
+			cmds = append(cmds, m.selectedFields(true)...)
+		case "f":
+			m.filter = m.filter.Next()
+			m.ensureSelection()
+			cmds = append(cmds, m.selectedFields(false)...)
+		case "S":
+			m.showSnoozed = !m.showSnoozed
+			m.ensureSelection()
+			cmds = append(cmds, m.selectedFields(false)...)
+		case "s":
+			if m.hasSelection {
+				if err := m.opts.Reminders.ToggleStar(m.selected); err != nil {
+					m.status = "Star update failed: " + err.Error()
+				} else {
+					m.status = "Star updated locally"
+				}
+			}
+		case "z":
+			if m.hasSelection {
+				m.mode = "snooze"
+			} else {
+				m.status = "Select a PR before snoozing"
+			}
+		case "u":
+			if m.hasSelection {
+				if err := m.opts.Reminders.Unsnooze(m.selected); err != nil {
+					m.status = "Unsnooze failed: " + err.Error()
+				} else {
+					m.status = "PR unsnoozed locally"
+					m.ensureSelection()
+				}
 			}
 		default:
 			if binding, ok := m.opts.Config.Bindings[key]; ok {
@@ -432,6 +529,9 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 				}
 			}
 		}
+	}
+	if wake := m.scheduleWake(); wake != nil {
+		cmds = append(cmds, wake)
 	}
 	m.maybeTick(&cmds)
 	return m, tea.Batch(cmds...)
@@ -450,139 +550,38 @@ func (m Model) sectionStatus(s section) (string, visualRole) {
 	case domain.Canceled:
 		return "○ canceled (r to retry)", roleCanceled
 	case domain.Ready:
+		summary := m.filterCountSummary(s)
 		if s.field.Stale(m.opts.Clock.Now()) {
-			return "△ stale · r to refresh", roleStale
+			return "△ stale · " + summary + " · r to refresh", roleStale
 		}
 		if len(s.field.Value) == 0 {
-			return "— empty", roleMuted
+			return "— " + summary, roleMuted
 		}
-		return fmt.Sprintf("● %d open", len(s.field.Value)), roleSuccess
+		return "● " + summary, roleSuccess
 	default:
 		return "○ not requested", roleUnrequested
 	}
 }
 
-func (m Model) View() string {
-	if m.console {
-		return m.consoleView()
-	}
-	if m.help {
-		return m.helpView()
-	}
-	if m.mode == "details" {
-		return m.detailsView()
-	}
-	scope := "no repository configured"
-	if len(m.opts.Repos) > 0 {
-		scope = strings.Join(m.opts.Repos, ", ")
-	}
-	lines := m.visual.header("fs-dash · Pull requests", scope, m.width)
-	compact := m.visual.compact || m.width < 52
-	panelOverhead := 2
-	selected, hasSelected := m.selectedPR()
-	contextLines := 0
-	if hasSelected {
-		contextLines = 1 + panelOverhead
-		if m.opts.Enricher != nil {
-			contextLines++
-		}
-	}
-	statusLines := 0
-	if m.status != "" {
-		statusLines = 1
-	}
-	sectionBase := len(m.sections) * (panelOverhead + 1)
-	if len(m.sections) == 0 {
-		sectionBase = panelOverhead + 1
-	}
-	visibleRows := max(1, m.height-len(lines)-1-contextLines-statusLines-sectionBase)
-	selectedSection := ""
-	if hasSelected {
-		selectedSection = selected.ID.Repo
-	}
-
-	if len(m.sections) == 0 {
-		lines = append(lines, m.visual.panel("Repository scope", []string{"No GitHub repository found. Add repositories = [\"owner/name\"] to ~/.config/fs-dash/config.toml or run from a GitHub checkout."}, m.width)...)
-	}
-	for _, s := range m.sections {
-		state, stateRole := m.sectionStatus(s)
-		title := m.visual.paint(roleAccent, s.repo) + " · " + m.visual.badge(state, stateRole)
-		content := []string{}
-		if s.field.HasValue {
-			if selectedSection != s.repo && len(s.field.Value) > 0 {
-				content = append(content, m.visual.paint(roleMuted, "Rows hidden; j/k selects across repositories."))
+func (m Model) filterCountSummary(s section) string {
+	filtered, pending := 0, 0
+	projected := m.projection()
+	for _, rows := range [][]triage.Row{projected.Review, projected.Active} {
+		for _, row := range rows {
+			if row.PR.ID.Repo != s.repo {
+				continue
 			}
-			if selectedSection == s.repo {
-				visible := min(visibleRows, len(s.field.Value))
-				index := 0
-				for i, pr := range s.field.Value {
-					if pr.ID == m.selected {
-						index = i
-						break
-					}
-				}
-				start := max(0, index-visible/2)
-				if start+visible > len(s.field.Value) {
-					start = max(0, len(s.field.Value)-visible)
-				}
-				end := min(len(s.field.Value), start+visible)
-				for _, pr := range s.field.Value[start:end] {
-					marker := " "
-					if m.hasSelection && pr.ID == m.selected {
-						marker = ">"
-					}
-					indicator := ""
-					indicatorRole := roleMuted
-					if m.opts.Enricher != nil {
-						key := domain.FieldKey{Item: pr.ID, Name: "review_summary", Revision: pr.HeadSHA}
-						if f := m.fields[key]; f != nil {
-							indicator = " " + f.DisplayState(m.opts.Clock.Now())
-							indicatorRole = phaseRole(f.Phase, f.Stale(m.opts.Clock.Now()))
-							if f.Phase.Active() {
-								indicator = " " + m.spinner() + " fetching"
-							}
-						} else {
-							indicator = " not requested"
-						}
-					}
-					lineWidth := m.width
-					if !compact {
-						lineWidth -= 4
-					}
-					content = append(content, m.visual.selected(marker, fmt.Sprint(pr.ID.Number), pr.Title, pr.Author, pr.UpdatedAt.Local().Format("Jan 02 15:04"), strings.TrimSpace(indicator), indicatorRole, max(1, lineWidth)))
-				}
+			filtered++
+			if row.FilterPending {
+				pending++
 			}
 		}
-		if len(content) == 0 {
-			content = []string{m.visual.paint(roleMuted, "No pull requests to show.")}
-		}
-		lines = append(lines, m.visual.panel(title, content, m.width)...)
 	}
-	if hasSelected {
-		context := []string{m.visual.paint(roleMuted, "Selected: ") + m.visual.paint(roleLink, selected.URL)}
-		if m.opts.Enricher != nil {
-			key := domain.FieldKey{Item: selected.ID, Name: "review_summary", Revision: selected.HeadSHA}
-			if f := m.fields[key]; f != nil {
-				role := phaseRole(f.Phase, f.Stale(m.opts.Clock.Now()))
-				state := f.DisplayState(m.opts.Clock.Now())
-				if f.Phase == domain.Cooldown {
-					state += " until " + f.RetryAt.Local().Format("15:04:05")
-				}
-				if f.Error != nil {
-					state += " · " + f.Error.Message
-				}
-				context = append(context, m.visual.paint(roleMuted, "Review summary: ")+m.visual.paint(role, state))
-			} else {
-				context = append(context, m.visual.paint(roleMuted, "Review summary: ")+m.visual.paint(rolePending, "queued"))
-			}
-		}
-		lines = append(lines, m.visual.context("Selected PR", context, m.width)...)
+	summary := fmt.Sprintf("%d open · %d in filter", len(s.field.Value), filtered)
+	if pending > 0 {
+		summary += fmt.Sprintf(" (%d pending)", pending)
 	}
-	if m.status != "" {
-		lines = append(lines, m.visual.paint(roleWarning, m.visual.fit(m.status, m.width)))
-	}
-	lines = append(lines, m.visual.footer("j/k move · enter details · r refresh · o open · L logs · ? help · q quit", m.width))
-	return strings.Join(lines, "\n") + "\n"
+	return summary
 }
 
 func (m Model) detailsView() string {
@@ -597,7 +596,7 @@ func (m Model) detailsView() string {
 		"Updated: " + m.visual.paint(roleNeutral, pr.UpdatedAt.Local().Format(time.RFC822)),
 		"Head: " + m.visual.paint(roleMuted, pr.HeadSHA),
 		"URL: " + m.visual.paint(roleLink, pr.URL),
-		m.visual.paint(roleMuted, "Detailed reviews, checks, and threads arrive in change 03."),
+		m.visual.paint(roleMuted, "Review and check signals are summarized in the list; detailed review threads arrive in change 03."),
 	}
 	lines := append(m.visual.header("fs-dash · PR details", pr.ID.Repo, m.width), m.visual.panel("Pull request", content, m.width)...)
 	if m.status != "" {
@@ -613,7 +612,7 @@ func (m Model) helpView() string {
 		keys = append(keys, key)
 	}
 	sort.Strings(keys)
-	content := []string{"j/k or arrows  move selection", "enter          PR details", "esc            back", "r              refresh all sections", "L              log console", "?              toggle help", "q              quit"}
+	content := []string{"j/k or arrows  move selection", "enter          PR details", "esc            back", "f              cycle all/assigned/review-requested", "s              toggle local star", "z              choose snooze duration", "S              show or hide snoozed PRs", "u              unsnooze selected PR", "r              refresh all sections", "L              log console", "?              toggle help", "q              quit"}
 	for _, key := range keys {
 		content = append(content, fmt.Sprintf("%s              %s", key, m.opts.Config.Bindings[key].Executable))
 	}
