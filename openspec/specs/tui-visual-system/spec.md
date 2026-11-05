@@ -6,6 +6,13 @@ Gives the dashboard a consistent visual language that helps developers locate th
 
 ## Requirements
 
+### Requirement: Start in a clean fullscreen terminal view
+The application SHALL use the terminal's alternate screen while the dashboard is running, so launch begins with a clean view and exiting restores the prior terminal contents.
+
+#### Scenario: Launch and exit the dashboard
+- **WHEN** the user starts the dashboard in a terminal and then exits
+- **THEN** the dashboard starts on a clean fullscreen view and the prior terminal contents are restored
+
 ### Requirement: Semantic color communicates status consistently
 The system SHALL use distinct, consistent colors for focus, neutral text, links, active fetching, current success, stale values, retry cooldown, warnings, and terminal failures across list, details, help, and logs. A selected row SHALL retain the visible status of its fields.
 

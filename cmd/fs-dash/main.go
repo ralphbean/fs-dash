@@ -62,7 +62,7 @@ func main() {
 		store = reminderStore
 	}
 	options := ui.Options{Config: cfg, Repos: repos, Lister: github.PRLister{}, Enricher: github.Enricher{}, Runner: localcmd.Runner{}, Reminders: store, ReminderLoadError: reminderErr}
-	if _, err := tea.NewProgram(ui.New(options)).Run(); err != nil {
+	if _, err := tea.NewProgram(ui.New(options), tea.WithAltScreen()).Run(); err != nil {
 		fmt.Fprintln(os.Stderr, "fs-dash:", err)
 		os.Exit(1)
 	}
