@@ -26,11 +26,15 @@ The system SHALL offer filters for all open PRs, PRs assigned to the current use
 ## ADDED Requirements
 
 ### Requirement: Review filters cycle in a predictable order
-The system SHALL cycle through filters in this order: all open PRs, authored by me, assigned to me, review requested from me, starred PRs, and snoozed PRs. The startup filter SHALL be authored by me. The user SHALL use the filter cycle to reach starred and snoozed PRs rather than dedicated filter keys.
+The system SHALL cycle through filters in this order: all open PRs, authored by me, assigned to me, review requested from me, starred PRs, and snoozed PRs. The startup filter SHALL be authored by me. The system SHALL show all filters horizontally with the active filter highlighted, and SHALL use `h` and `l` to move to the previous and next filter, wrapping at either end.
 
 #### Scenario: Cycle review filters
 - **WHEN** the user advances through the review filters
 - **THEN** the sequence is all open PRs, authored by me, assigned to me, review requested from me, starred PRs, snoozed PRs, then all open PRs again
+
+#### Scenario: Navigate the filter tabs
+- **WHEN** the user presses `h` or `l`
+- **THEN** the active tab moves to the previous or next filter in order and wraps at either end
 
 #### Scenario: Show starred PRs
 - **WHEN** the active filter is starred PRs
@@ -42,4 +46,8 @@ The system SHALL cycle through filters in this order: all open PRs, authored by 
 
 #### Scenario: Filter navigation help
 - **WHEN** the user views the list or keyboard help
-- **THEN** filter navigation is shown as a cycle and no dedicated key is shown for starred or snoozed filters
+- **THEN** `h` and `l` are shown as previous and next filter navigation, with no dedicated filter-cycle key
+
+#### Scenario: Horizontal filter tabs
+- **WHEN** the list is displayed
+- **THEN** all filters appear together in one horizontal tab strip, the active filter is visually highlighted, narrow terminals use compact labels to keep the tabs visible, and the PR attention heading does not repeat the active filter name

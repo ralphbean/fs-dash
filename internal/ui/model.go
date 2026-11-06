@@ -504,10 +504,18 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 				cmds = append(cmds, m.fetchList(s.repo, g, 1))
 			}
 			cmds = append(cmds, m.selectedFields(true)...)
-		case "f":
-			m.filter = m.filter.Next()
-			m.ensureSelection()
-			cmds = append(cmds, m.selectedFields(false)...)
+		case "h":
+			if m.mode == "list" {
+				m.filter = m.filter.Prev()
+				m.ensureSelection()
+				cmds = append(cmds, m.selectedFields(false)...)
+			}
+		case "l":
+			if m.mode == "list" {
+				m.filter = m.filter.Next()
+				m.ensureSelection()
+				cmds = append(cmds, m.selectedFields(false)...)
+			}
 		case "s":
 			if m.hasSelection {
 				if err := m.opts.Reminders.ToggleStar(m.selected); err != nil {
@@ -627,7 +635,7 @@ func (m Model) helpView() string {
 		keys = append(keys, key)
 	}
 	sort.Strings(keys)
-	content := []string{"j/k or arrows  move selection", "enter          PR details", "esc            back", "f              cycle all/authored/assigned/review-requested/starred/snoozed", "s              toggle local star", "z              choose snooze duration", "u              unsnooze selected PR", "r              refresh all sections", "L              log console", "?              toggle help", "q              quit"}
+	content := []string{"j/k or arrows  move selection", "h/l            previous/next filter", "enter          PR details", "esc            back", "s              toggle local star", "z              choose snooze duration", "u              unsnooze selected PR", "r              refresh all sections", "L              log console", "?              toggle help", "q              quit"}
 	for _, key := range keys {
 		content = append(content, fmt.Sprintf("%s              %s", key, m.opts.Config.Bindings[key].Executable))
 	}

@@ -19,23 +19,34 @@ const (
 	FilterSnoozed         Filter = "snoozed"
 )
 
+var filterOrder = []Filter{
+	FilterAll,
+	FilterAuthored,
+	FilterAssigned,
+	FilterReviewRequested,
+	FilterStarred,
+	FilterSnoozed,
+}
+
+func Filters() []Filter {
+	return append([]Filter(nil), filterOrder...)
+}
+
 func (f Filter) Next() Filter {
-	switch f {
-	case FilterAll:
-		return FilterAuthored
-	case FilterAssigned:
-		return FilterReviewRequested
-	case FilterReviewRequested:
-		return FilterStarred
-	case FilterAuthored:
-		return FilterAssigned
-	case FilterStarred:
-		return FilterSnoozed
-	case FilterSnoozed:
-		return FilterAll
-	default:
-		return FilterAll
+	return f.move(1)
+}
+
+func (f Filter) Prev() Filter {
+	return f.move(-1)
+}
+
+func (f Filter) move(direction int) Filter {
+	for i, candidate := range filterOrder {
+		if candidate == f {
+			return filterOrder[(i+direction+len(filterOrder))%len(filterOrder)]
+		}
 	}
+	return FilterAll
 }
 
 func (f Filter) Label() string {

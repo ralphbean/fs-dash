@@ -22,6 +22,72 @@ func (m Model) showingSnoozed() bool {
 	return m.filter == triage.FilterSnoozed
 }
 
+func filterTabLabel(filter triage.Filter, width int) string {
+	if width < 28 {
+		switch filter {
+		case triage.FilterAll:
+			return "All"
+		case triage.FilterAuthored:
+			return "Au"
+		case triage.FilterAssigned:
+			return "As"
+		case triage.FilterReviewRequested:
+			return "Rq"
+		case triage.FilterStarred:
+			return "St"
+		case triage.FilterSnoozed:
+			return "Sn"
+		}
+	}
+	if width < 50 {
+		switch filter {
+		case triage.FilterAll:
+			return "All"
+		case triage.FilterAuthored:
+			return "Auth"
+		case triage.FilterAssigned:
+			return "Asgn"
+		case triage.FilterReviewRequested:
+			return "Req"
+		case triage.FilterStarred:
+			return "Star"
+		case triage.FilterSnoozed:
+			return "Snooz"
+		}
+	}
+	switch filter {
+	case triage.FilterAll:
+		return "All"
+	case triage.FilterAuthored:
+		return "Authored"
+	case triage.FilterAssigned:
+		return "Assigned"
+	case triage.FilterReviewRequested:
+		return "Review req"
+	case triage.FilterStarred:
+		return "Starred"
+	case triage.FilterSnoozed:
+		return "Snoozed"
+	default:
+		return filter.Label()
+	}
+}
+
+func (m Model) filterTabs() string {
+	filters := triage.Filters()
+	tabs := make([]string, 0, len(filters))
+	for _, filter := range filters {
+		label := filterTabLabel(filter, m.width)
+		role := roleNeutral
+		if filter == m.filter {
+			label = "[" + label + "]"
+			role = roleFocus
+		}
+		tabs = append(tabs, m.visual.paint(role, label))
+	}
+	return m.visual.fit(strings.Join(tabs, " "), m.width)
+}
+
 func (m Model) fieldFor(pr domain.PR, name string) *domain.Field[any] {
 	return m.fields[domain.FieldKey{Item: pr.ID, Name: name, Revision: pr.HeadSHA}]
 }
@@ -264,7 +330,7 @@ func (m Model) visibleRowsForPrefetch() []domain.PR {
 	selectedLine := -1
 	contentLine := 0
 	if m.showingSnoozed() {
-		contentLine = 2 // Snoozed heading and table header.
+		contentLine = 1 // Table header.
 		for _, row := range sections.Snoozed {
 			if row.PR.ID == m.selected {
 				selectedLine = contentLine
@@ -553,15 +619,7 @@ func (m Model) listView() string {
 		scope = strings.Join(m.opts.Repos, ", ")
 	}
 	lines := m.visual.header("fs-dash · Pull requests", scope, m.width)
-	if m.showingSnoozed() {
-		lines = append(lines, m.visual.paint(roleAccent, m.visual.fit("Snoozed PRs · f cycle · u unsnooze", m.width)))
-	} else {
-		filterLabel := "Filter: " + m.filter.Label() + " · f cycle · s star · z snooze"
-		if m.width < 52 {
-			filterLabel = "Filter: " + m.filter.Label() + " · f · s · z"
-		}
-		lines = append(lines, m.visual.paint(roleAccent, m.visual.fit(filterLabel, m.width)))
-	}
+	lines = append(lines, m.filterTabs())
 	tableRows := make([]triage.Row, 0, len(sections.Review)+len(sections.Active)+len(sections.Snoozed))
 	if m.showingSnoozed() {
 		tableRows = append(tableRows, sections.Snoozed...)
@@ -574,7 +632,6 @@ func (m Model) listView() string {
 	rows := make(map[domain.ItemID]triage.Row)
 	selectedLine := -1
 	if m.showingSnoozed() {
-		content = append(content, m.visual.paint(roleAccent, "SNOOZED"))
 		content = append(content, m.renderTableHeader(columns, widths))
 		for _, row := range sections.Snoozed {
 			rows[row.PR.ID] = row
@@ -584,7 +641,7 @@ func (m Model) listView() string {
 			content = append(content, m.renderTableRow(row, columns, widths, m.hasSelection && row.PR.ID == m.selected))
 		}
 	} else {
-		content = append(content, m.visual.paint(roleAccent, "REVIEW · "+strings.ToUpper(m.filter.Label())))
+		content = append(content, m.visual.paint(roleAccent, "REVIEW"))
 		if summaries := m.repositorySummaryLine(); summaries != "" {
 			content = append(content, summaries)
 		}
@@ -649,9 +706,9 @@ func (m Model) listView() string {
 	if m.status != "" {
 		lines = append(lines, m.visual.paint(roleWarning, m.visual.fit(m.status, m.width)))
 	}
-	footer := "j/k move · enter details · f filters · s star · z snooze · r refresh · L logs · ? help · q quit"
+	footer := "h/l filters · j/k move · enter details · s star · z snooze · r refresh · L logs · ? help · q quit"
 	if m.showingSnoozed() {
-		footer = "j/k move · f filters · u unsnooze · L logs · ? help · q quit"
+		footer = "h/l filters · j/k move · s star · z snooze · u unsnooze · L logs · ? help · q quit"
 	}
 	lines = append(lines, m.visual.footer(footer, m.width))
 	return strings.Join(lines, "\n") + "\n"

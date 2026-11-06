@@ -6,7 +6,8 @@ The authored-by-me filter should be the default and first personal view, while s
 
 - Move authored-by-me to the first personal filter in the cycle, immediately after all open PRs.
 - Make authored-by-me the startup filter.
-- Add starred and snoozed PRs as filters in the same cycle so users reach them with `f`; remove the dedicated `S` shortcut for the snoozed view.
+- Show the filters together in a horizontal tab strip, with the active filter highlighted; navigate left and right with `h` and `l`.
+- Remove the one-way `f` filter shortcut and avoid repeating the active filter name or item-action hints in the PR attention pane.
 - Keep `s` for starring a PR, `z` for choosing its snooze duration, and `u` for unsnoozing.
 
 ## Capabilities
@@ -21,4 +22,4 @@ None.
 
 ## Impact
 
-- Affects TUI filter initialization, projection, keyboard handling, and help text in `internal/ui/model.go`, `internal/ui/triage.go`, and `internal/triage/projection.go`, plus the PR triage specification.
+- Affects TUI filter initialization, projection, keyboard handling, tab rendering, and help text in `internal/ui/model.go`, `internal/ui/triage.go`, and `internal/triage/projection.go`, plus `internal/config/config.go` and the PR triage specification.

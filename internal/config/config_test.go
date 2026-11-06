@@ -71,7 +71,7 @@ func TestBindingKeepsURLAsSingleArgument(t *testing.T) {
 }
 
 func TestTriageHotkeysAreReservedFromCustomBindings(t *testing.T) {
-	for _, key := range []string{"f", "s", "z", "S", "u"} {
+	for _, key := range []string{"h", "l", "s", "z", "u"} {
 		cfg := Default()
 		cfg.Bindings[key] = Binding{Executable: "custom"}
 		if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), key) {

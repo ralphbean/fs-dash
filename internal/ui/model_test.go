@@ -106,7 +106,7 @@ func TestRepositorySummariesShareOneHorizontalRow(t *testing.T) {
 		lines := strings.Split(strings.TrimSuffix(ansi.Strip(view), "\n"), "\n")
 		reviewLine, tableHeaderLine := -1, -1
 		for i, line := range lines {
-			if strings.Contains(line, "REVIEW ·") {
+			if strings.Contains(line, "REVIEW") {
 				reviewLine = i
 			}
 			if strings.Contains(line, "PR") && strings.Contains(line, "Title") {
@@ -351,10 +351,10 @@ func TestStarSnoozeHiddenViewAndManualUnsnooze(t *testing.T) {
 		t.Fatal("snoozed PR remained in the normal view")
 	}
 	for range 4 {
-		next, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'f'}})
+		next, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'l'}})
 		m = next.(Model)
 	}
-	if !strings.Contains(m.View(), "SNOOZED") || !strings.Contains(m.View(), "★ starred") {
+	if !strings.Contains(m.View(), "Snoozed") || !strings.Contains(m.View(), "★ starred") {
 		t.Fatalf("hidden snoozed item is not inspectable: %s", m.View())
 	}
 	next, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'u'}})
@@ -362,7 +362,7 @@ func TestStarSnoozeHiddenViewAndManualUnsnooze(t *testing.T) {
 	if !m.opts.Reminders.Snapshot()[pr.ID].SnoozedUntil.IsZero() {
 		t.Fatal("manual unsnooze did not clear wake time")
 	}
-	next, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'f'}})
+	next, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'l'}})
 	m = next.(Model)
 	if len(m.allRows()) != 1 || m.allRows()[0].ID != pr.ID {
 		t.Fatal("unsnoozed PR did not return to normal view")
