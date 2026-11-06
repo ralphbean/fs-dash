@@ -5,8 +5,10 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/url"
 	"os/exec"
 	"regexp"
+	"sort"
 	"strings"
 	"time"
 
@@ -572,7 +574,7 @@ func fieldValue(name, viewer string, pr *struct {
 			if comment.Author != nil {
 				author = comment.Author.Login
 			}
-			comments = append(comments, activityComment{Body: comment.Body, CreatedAt: comment.CreatedAt, URL: comment.URL, Author: author})
+			comments = append(comments, activityComment{Body: comment.Body, CreatedAt: comment.CreatedAt, UpdatedAt: comment.UpdatedAt, URL: comment.URL, Author: author})
 		}
 		return classifyActivity(comments, !pr.Comments.PageInfo.HasPreviousPage, now), nil
 	default:
@@ -583,19 +585,26 @@ func fieldValue(name, viewer string, pr *struct {
 type activityComment struct {
 	Body      string
 	CreatedAt time.Time
+	UpdatedAt time.Time
 	URL       string
 	Author    string
 }
 
+type activityCandidate struct {
+	body, url, author string
+	createdAt         time.Time
+	updatedAt         time.Time
+	runID             string
+	index             int
+}
+
+var fullsendAgentName = regexp.MustCompile(`(?m)^🤖 (.+?) · Started(?: |$)`)
+var fullsendWorkflowLink = regexp.MustCompile(`\[View workflow run[^\]]*\]\(([^)\s]+)\)`)
+
 func classifyActivity(comments []activityComment, complete bool, now time.Time) domain.ActivityEvidence {
-	out := domain.ActivityEvidence{State: domain.ActivityUnknown, Complete: complete, FetchedAt: now, FreshUntil: now.Add(fieldFreshFor)}
-	type candidate struct {
-		body, url, author string
-		createdAt         time.Time
-		runID             string
-		index             int
-	}
-	var latest *candidate
+	out := domain.ActivityEvidence{State: domain.ActivityUnknown, Complete: complete, RunsComplete: complete, FetchedAt: now, FreshUntil: now.Add(fieldFreshFor)}
+	var latest *activityCandidate
+	byRun := make(map[string]activityCandidate)
 	for i, comment := range comments {
 		if _, ok := fullsendAgentLogins[comment.Author]; !ok {
 			continue
@@ -604,9 +613,13 @@ func classifyActivity(comments []activityComment, complete bool, now time.Time) 
 		if len(match) != 2 {
 			continue
 		}
-		item := candidate{body: comment.Body, url: comment.URL, author: comment.Author, createdAt: comment.CreatedAt, runID: match[1], index: i}
+		item := activityCandidate{body: comment.Body, url: comment.URL, author: comment.Author, createdAt: comment.CreatedAt, updatedAt: comment.UpdatedAt, runID: match[1], index: i}
 		if latest == nil || item.createdAt.After(latest.createdAt) || (item.createdAt.Equal(latest.createdAt) && item.index > latest.index) {
 			latest = &item
+		}
+		previous, ok := byRun[item.runID]
+		if !ok || newerActivityStatus(item, previous) {
+			byRun[item.runID] = item
 		}
 	}
 	if latest == nil {
@@ -615,8 +628,35 @@ func classifyActivity(comments []activityComment, complete bool, now time.Time) 
 		}
 		return out
 	}
-	out.URL, out.Author, out.RunID, out.StartedAt = latest.url, latest.author, latest.runID, latest.createdAt
 	out.Complete = true // The page contains the newest comments; older markers cannot supersede this one.
+	for _, run := range byRun {
+		if strings.Contains(run.body, fullsendTerminalMarker) || run.createdAt.IsZero() || run.createdAt.After(now) || now.Sub(run.createdAt) >= activityStaleAfter {
+			continue
+		}
+		name := activityAgentName(run.body)
+		if name == "" {
+			name = fallbackAgentName(run.author)
+		}
+		out.Runs = append(out.Runs, domain.ActivityRun{
+			RunID:       run.runID,
+			Name:        name,
+			WorkflowURL: workflowURL(run.body),
+			StartedAt:   run.createdAt,
+		})
+	}
+	sort.Slice(out.Runs, func(i, j int) bool {
+		if !out.Runs[i].StartedAt.Equal(out.Runs[j].StartedAt) {
+			return out.Runs[i].StartedAt.Before(out.Runs[j].StartedAt)
+		}
+		return out.Runs[i].RunID < out.Runs[j].RunID
+	})
+	if len(out.Runs) > 0 {
+		active := byRun[out.Runs[len(out.Runs)-1].RunID]
+		out.State = domain.ActivityActive
+		out.URL, out.Author, out.RunID, out.StartedAt = active.url, active.author, active.runID, active.createdAt
+		return out
+	}
+	out.URL, out.Author, out.RunID, out.StartedAt = latest.url, latest.author, latest.runID, latest.createdAt
 	if latest.createdAt.IsZero() || latest.createdAt.After(now) {
 		out.State = domain.ActivityUnknown
 		out.Complete = false
@@ -628,4 +668,65 @@ func classifyActivity(comments []activityComment, complete bool, now time.Time) 
 		out.State = domain.ActivityActive
 	}
 	return out
+}
+
+func newerActivityStatus(candidate, previous activityCandidate) bool {
+	candidateAt := candidate.updatedAt
+	if candidateAt.IsZero() {
+		candidateAt = candidate.createdAt
+	}
+	previousAt := previous.updatedAt
+	if previousAt.IsZero() {
+		previousAt = previous.createdAt
+	}
+	return candidateAt.After(previousAt) || (candidateAt.Equal(previousAt) && candidate.index > previous.index)
+}
+
+func activityAgentName(body string) string {
+	match := fullsendAgentName.FindStringSubmatch(body)
+	if len(match) != 2 {
+		return ""
+	}
+	name := strings.TrimSpace(match[1])
+	name = strings.Map(func(r rune) rune {
+		if r < 0x20 || r == 0x7f {
+			return -1
+		}
+		return r
+	}, name)
+	return name
+}
+
+func fallbackAgentName(author string) string {
+	switch author {
+	case "fullsend-ai-review":
+		return "Review"
+	case "fullsend-ai-coder":
+		return "Code"
+	case "fullsend-ai-triage":
+		return "Triage"
+	case "fullsend-ai-retro":
+		return "Retro"
+	case "fullsend-ai-prioritize":
+		return "Prioritize"
+	default:
+		return "Fullsend agent"
+	}
+}
+
+func workflowURL(body string) string {
+	match := fullsendWorkflowLink.FindStringSubmatch(body)
+	if len(match) != 2 {
+		return ""
+	}
+	parsed, err := url.Parse(match[1])
+	if err != nil || parsed.Scheme != "https" || parsed.Host == "" || parsed.User != nil {
+		return ""
+	}
+	for _, r := range match[1] {
+		if r < 0x20 || r == 0x7f {
+			return ""
+		}
+	}
+	return parsed.String()
 }

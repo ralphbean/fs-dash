@@ -233,14 +233,23 @@ const (
 )
 
 type ActivityEvidence struct {
-	State      ActivityState
-	URL        string
-	Author     string
-	RunID      string
-	StartedAt  time.Time
-	FetchedAt  time.Time
-	FreshUntil time.Time
-	Complete   bool
+	State        ActivityState
+	URL          string
+	Author       string
+	RunID        string
+	StartedAt    time.Time
+	Runs         []ActivityRun
+	RunsComplete bool
+	FetchedAt    time.Time
+	FreshUntil   time.Time
+	Complete     bool
+}
+
+type ActivityRun struct {
+	RunID       string
+	Name        string
+	WorkflowURL string
+	StartedAt   time.Time
 }
 
 type Dependency struct {

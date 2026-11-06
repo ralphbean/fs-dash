@@ -2,10 +2,13 @@ package ui
 
 import (
 	"fmt"
+	"net/url"
 	"strings"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
 	"github.com/fullsend-ai/fs-dash/internal/domain"
 	"github.com/fullsend-ai/fs-dash/internal/ports"
 	"github.com/fullsend-ai/fs-dash/internal/reminder"
@@ -239,10 +242,34 @@ func (m Model) triageInput(pr domain.PR, saved reminder.Entry) triage.Input {
 				if f.Stale(m.opts.Clock.Now()) && activity.State == domain.ActivityActive {
 					in.Activity.State = domain.ActivityStale
 				}
+				if in.Activity.State == domain.ActivityActive && len(in.Activity.Runs) == 0 && in.Activity.RunID != "" {
+					in.Activity.Runs = []domain.ActivityRun{{
+						RunID:     in.Activity.RunID,
+						Name:      fallbackActivityRunName(in.Activity.Author),
+						StartedAt: in.Activity.StartedAt,
+					}}
+				}
 			}
 		}
 	}
 	return in
+}
+
+func fallbackActivityRunName(author string) string {
+	switch author {
+	case "fullsend-ai-review":
+		return "Review"
+	case "fullsend-ai-coder":
+		return "Code"
+	case "fullsend-ai-triage":
+		return "Triage"
+	case "fullsend-ai-retro":
+		return "Retro"
+	case "fullsend-ai-prioritize":
+		return "Prioritize"
+	default:
+		return "Fullsend agent"
+	}
 }
 
 func loginSignal(set domain.LoginSet, viewer, source, version string) domain.DerivedBool {
@@ -1132,12 +1159,16 @@ const (
 	listContentText listContentKind = iota
 	listContentTableHeader
 	listContentPR
+	listContentActivityRun
+	listContentActivityNotice
 )
 
 type listContentLine struct {
-	kind listContentKind
-	text string
-	row  triage.Row
+	kind    listContentKind
+	text    string
+	row     triage.Row
+	run     domain.ActivityRun
+	lastRun bool
 }
 
 func (m Model) listView() string {
@@ -1156,6 +1187,10 @@ func (m Model) listView() string {
 	appendText := func(text string) { content = append(content, listContentLine{kind: listContentText, text: text}) }
 	appendHeader := func() { content = append(content, listContentLine{kind: listContentTableHeader}) }
 	appendPR := func(row triage.Row) { content = append(content, listContentLine{kind: listContentPR, row: row}) }
+	appendRun := func(run domain.ActivityRun, last bool) {
+		content = append(content, listContentLine{kind: listContentActivityRun, run: run, lastRun: last})
+	}
+	appendRunNotice := func() { content = append(content, listContentLine{kind: listContentActivityNotice}) }
 	selectedLine := -1
 	if m.showingSnoozed() {
 		appendHeader()
@@ -1185,6 +1220,12 @@ func (m Model) listView() string {
 					selectedLine = len(content)
 				}
 				appendPR(row)
+				for i, run := range row.Activity.Runs {
+					appendRun(run, i == len(row.Activity.Runs)-1 && row.Activity.RunsComplete)
+				}
+				if !row.Activity.RunsComplete {
+					appendRunNotice()
+				}
 			}
 		}
 	}
@@ -1220,6 +1261,7 @@ func (m Model) listView() string {
 	}
 	end := min(len(content), start+available)
 	columns, widths := m.tableColumns(visibleContentRows(content[start:end]), m.showingSnoozed())
+	prIndent := tableIndentForPR(columns, widths)
 	visibleContent := make([]string, 0, end-start)
 	for _, line := range content[start:end] {
 		switch line.kind {
@@ -1227,6 +1269,10 @@ func (m Model) listView() string {
 			visibleContent = append(visibleContent, m.renderTableHeader(columns, widths))
 		case listContentPR:
 			visibleContent = append(visibleContent, m.renderTableRow(line.row, columns, widths, m.hasSelection && line.row.PR.ID == m.selected))
+		case listContentActivityRun:
+			visibleContent = append(visibleContent, m.activeRunLine(line.run, line.lastRun, prIndent))
+		case listContentActivityNotice:
+			visibleContent = append(visibleContent, m.incompleteActivityRunsLine(prIndent))
 		default:
 			visibleContent = append(visibleContent, line.text)
 		}
@@ -1258,6 +1304,92 @@ func visibleContentRows(lines []listContentLine) []triage.Row {
 		}
 	}
 	return rows
+}
+
+func tableIndentForPR(specs []tableColumnSpec, widths []int) int {
+	for i, spec := range specs {
+		if spec.column != columnPR {
+			continue
+		}
+		indent := i // one separator space before each column after the first
+		for j := 0; j < i && j < len(widths); j++ {
+			indent += widths[j]
+		}
+		return indent
+	}
+	return 0
+}
+
+func (m Model) activeRunLine(run domain.ActivityRun, last bool, indent int) string {
+	branch := "├─ "
+	if last {
+		branch = "└─ "
+	}
+	branch = strings.Repeat(" ", max(0, indent)) + branch
+	name := strings.TrimSpace(run.Name)
+	if name == "" {
+		name = "Fullsend agent"
+	}
+	duration := formatRunElapsed(m.opts.Clock.Now().Sub(run.StartedAt))
+	suffix := " · " + duration
+	linkLabel := " · ↗ workflow"
+	url := safeWorkflowURL(run.WorkflowURL)
+	width := m.width
+	if !m.visual.compact && m.width >= 52 {
+		width -= 4
+	}
+	width = max(1, width)
+	nameWidth := width - lipgloss.Width(branch) - lipgloss.Width(suffix)
+	if url != "" {
+		nameWidth -= lipgloss.Width(linkLabel)
+	}
+	if nameWidth < 1 && url != "" {
+		url = ""
+		nameWidth = width - lipgloss.Width(branch) - lipgloss.Width(suffix)
+	}
+	nameWidth = max(1, nameWidth)
+	line := m.visual.paint(roleMuted, branch) + m.visual.paint(roleNeutral, m.visual.fit(name, nameWidth)) + m.visual.paint(roleAccent, suffix)
+	if url != "" {
+		line += ansi.SetHyperlink(url) + m.visual.paint(roleLink, linkLabel) + ansi.ResetHyperlink()
+	}
+	return m.visual.fit(line, width)
+}
+
+func (m Model) incompleteActivityRunsLine(indent int) string {
+	width := m.width
+	if !m.visual.compact && m.width >= 52 {
+		width -= 4
+	}
+	branch := strings.Repeat(" ", max(0, indent)) + "└─ "
+	return m.visual.fit(m.visual.paint(roleMuted, branch+"run history may be incomplete"), max(1, width))
+}
+
+func formatRunElapsed(elapsed time.Duration) string {
+	seconds := int64(elapsed / time.Second)
+	if seconds < 0 {
+		seconds = 0
+	}
+	minutes := seconds / 60
+	if minutes >= 60 {
+		return fmt.Sprintf("%dh %02dm", minutes/60, minutes%60)
+	}
+	if minutes > 0 {
+		return fmt.Sprintf("%dm %02ds", minutes, seconds%60)
+	}
+	return fmt.Sprintf("%ds", seconds)
+}
+
+func safeWorkflowURL(raw string) string {
+	parsed, err := url.Parse(raw)
+	if err != nil || parsed.Scheme != "https" || parsed.Host == "" || parsed.User != nil {
+		return ""
+	}
+	for _, r := range raw {
+		if r < 0x20 || r == 0x7f {
+			return ""
+		}
+	}
+	return parsed.String()
 }
 
 func (m Model) View() string {

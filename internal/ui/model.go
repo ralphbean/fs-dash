@@ -56,6 +56,7 @@ type Model struct {
 	logLevel                        string
 	logOffset, width, height, frame int
 	tickRunning                     bool
+	runClockTickRunning             bool
 	status                          string
 	reminderWarning                 string
 	fields                          map[domain.FieldKey]*domain.Field[any]
@@ -146,6 +147,7 @@ type retryMsg struct {
 	generation uint64
 }
 type tickMsg time.Time
+type runClockTickMsg struct{}
 type wakeMsg struct{ generation uint64 }
 type fieldOffscreenWakeMsg struct{ generation uint64 }
 type activityOffscreenWakeMsg struct{ generation uint64 }
@@ -341,6 +343,9 @@ func dereferenceCachedValue(value any) any {
 }
 func spinnerTick() tea.Cmd {
 	return tea.Tick(100*time.Millisecond, func(t time.Time) tea.Msg { return tickMsg(t) })
+}
+func runClockTick() tea.Cmd {
+	return tea.Tick(time.Second, func(time.Time) tea.Msg { return runClockTickMsg{} })
 }
 func (m Model) Init() tea.Cmd {
 	var cmds []tea.Cmd
@@ -552,6 +557,23 @@ func (m *Model) maybeTick(cmds *[]tea.Cmd) {
 		*cmds = append(*cmds, spinnerTick())
 	}
 }
+func (m Model) activeRunClockVisible() bool {
+	if m.mode != "list" || m.console || m.help || m.showingSnoozed() {
+		return false
+	}
+	for _, row := range m.projection().Active {
+		if len(row.Activity.Runs) > 0 || (row.Activity.RunID != "" && row.Activity.State == domain.ActivityActive) {
+			return true
+		}
+	}
+	return false
+}
+func (m *Model) maybeRunClockTick(cmds *[]tea.Cmd) {
+	if m.activeRunClockVisible() && !m.runClockTickRunning {
+		m.runClockTickRunning = true
+		*cmds = append(*cmds, runClockTick())
+	}
+}
 func (m *Model) applySnooze(duration time.Duration) {
 	if !m.hasSelection {
 		m.mode = "list"
@@ -577,6 +599,8 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 	case tickMsg:
 		m.tickRunning = false
 		m.frame = (m.frame + 1) % len(frames)
+	case runClockTickMsg:
+		m.runClockTickRunning = false
 	case wakeMsg:
 		if msg.generation == m.wakeGeneration {
 			m.wakeTickRunning = false
@@ -855,6 +879,7 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		cmds = append(cmds, wake)
 	}
 	m.maybeTick(&cmds)
+	m.maybeRunClockTick(&cmds)
 	return m, tea.Batch(cmds...)
 }
 

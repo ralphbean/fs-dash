@@ -84,7 +84,7 @@ The PR list SHALL provide the `e` key to toggle compact status columns between e
 - **THEN** the selected emoji or text mode is used in each section
 
 ### Requirement: Remote Fullsend activity section
-The system SHALL place PRs with current, source-backed remote Fullsend agent activity in a separate section and SHALL show unknown, stale, and failed activity detection distinctly from inactive.
+The system SHALL place PRs with current, source-backed remote Fullsend agent activity in a separate section and SHALL show unknown, stale, and failed activity detection distinctly from inactive. For each active PR, the section SHALL show a process-tree style child entry for every currently active Fullsend agent run found in the activity evidence, including a readable agent name, a link to that run's workflow, and its elapsed running time. Child rows SHALL align under the PR identity column after the Star column. Elapsed time SHALL update while the active-agent section is visible. If the activity evidence does not cover the complete run history, the section SHALL identify the run list as potentially incomplete.
 
 #### Scenario: Activity prefetch after list load
 - **WHEN** a repository's open PR list loads
@@ -105,6 +105,26 @@ The system SHALL place PRs with current, source-backed remote Fullsend agent act
 #### Scenario: Activity confirmed
 - **WHEN** current evidence indicates a remote Fullsend agent is working on the PR
 - **THEN** the PR appears in the active-agent section with evidence time and source
+
+#### Scenario: Active PR shows agent run children
+- **WHEN** current status-comment evidence identifies one or more non-terminal, non-stale Fullsend agent runs for a PR
+- **THEN** the active-agent section shows the PR followed by a nested process-tree entry for each active run, with the agent's readable name, a workflow-run link, and elapsed time since that run started
+
+#### Scenario: Active run elapsed time advances
+- **WHEN** an active-agent PR remains visible while one of its runs continues
+- **THEN** that run's displayed elapsed time advances without requiring another GitHub request
+
+#### Scenario: Completed or stale run is not shown as active
+- **WHEN** a run's latest status evidence is terminal or older than the existing activity freshness threshold
+- **THEN** the run is omitted from the active-run children and is not presented as currently running
+
+#### Scenario: Workflow link is unavailable
+- **WHEN** a status comment identifies an active run but has no usable workflow-run URL
+- **THEN** the agent name and elapsed time remain visible and the run is shown without a misleading link
+
+#### Scenario: Activity comment history is incomplete
+- **WHEN** the activity query indicates that older comments were omitted from the fetched page
+- **THEN** the section shows active runs found in the fetched evidence and visibly indicates that earlier run history may be incomplete
 
 ### Requirement: Derived review signals
 The system SHALL derive bot approval from current effective reviews and SHALL distinguish unknown from false. It SHALL update derived ranking when review, check, or activity inputs change.
