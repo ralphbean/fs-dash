@@ -29,6 +29,10 @@ type PR struct {
 	Assignees AssigneeSet
 }
 
+type TimelineActivity struct {
+	UpdatedAt time.Time
+}
+
 type PRList struct {
 	PullRequests []PR
 	ViewerLogin  string

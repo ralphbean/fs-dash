@@ -11,12 +11,12 @@ import (
 	"github.com/fullsend-ai/fs-dash/internal/triage"
 )
 
-var triageFieldNames = []string{"reviews", "review_requests", "assignees", "checks", "review_threads", "activity"}
+var triageFieldNames = []string{"reviews", "review_requests", "assignees", "checks", "review_threads", "last_touched", "activity"}
 
 const maxConcurrentActivityFetches = 5
 const maxConcurrentFieldFetches = 2
 
-var tableSummaryFieldNames = []string{"checks", "reviews", "review_threads", "assignees"}
+var tableSummaryFieldNames = []string{"last_touched", "checks", "reviews", "review_threads", "assignees"}
 
 func (m Model) fieldFor(pr domain.PR, name string) *domain.Field[any] {
 	return m.fields[domain.FieldKey{Item: pr.ID, Name: name, Revision: pr.HeadSHA}]
@@ -427,7 +427,7 @@ func (m *Model) enqueueListSummaries(prs []domain.PR) {
 		return
 	}
 	for _, pr := range prs {
-		for _, name := range []string{"checks", "reviews", "review_threads"} {
+		for _, name := range []string{"last_touched", "checks", "reviews", "review_threads"} {
 			m.queueField(domain.FieldKey{Item: pr.ID, Name: name, Revision: pr.HeadSHA}, false)
 		}
 		if !pr.Assignees.Complete {

@@ -90,7 +90,7 @@ func (m Model) tableCellFor(row triage.Row, column tableColumn) tableCell {
 	case columnAssignees:
 		return m.assigneeCell(row.PR)
 	case columnUpdated:
-		return tableCell{text: relativeTime(m.opts.Clock.Now(), row.PR.UpdatedAt), role: roleMuted}
+		return m.updatedCell(row.PR)
 	case columnChecks:
 		text, role := m.checksCell(row.PR)
 		return tableCell{text: text, role: role}
@@ -108,6 +108,31 @@ func (m Model) tableCellFor(row triage.Row, column tableColumn) tableCell {
 	default:
 		return tableCell{text: "", role: roleMuted}
 	}
+}
+
+func (m Model) updatedCell(pr domain.PR) tableCell {
+	field := m.fieldFor(pr, "last_touched")
+	if field == nil {
+		return tableCell{text: "pending", role: roleUnrequested}
+	}
+	if field.Phase.Active() {
+		return tableCell{text: "pending", role: rolePending}
+	}
+	if field.Phase == domain.Failed || field.Phase == domain.Cooldown {
+		return tableCell{text: "unavailable", role: roleFailure}
+	}
+	if field.Phase == domain.Canceled || !field.HasValue {
+		return tableCell{text: "unavailable", role: roleMuted}
+	}
+	activity, ok := field.Value.(domain.TimelineActivity)
+	if !ok || activity.UpdatedAt.IsZero() {
+		return tableCell{text: "unavailable", role: roleMuted}
+	}
+	role := roleMuted
+	if field.Stale(m.opts.Clock.Now()) {
+		role = roleStale
+	}
+	return tableCell{text: relativeTime(m.opts.Clock.Now(), activity.UpdatedAt), role: role}
 }
 
 func (m Model) assigneeCell(pr domain.PR) tableCell {

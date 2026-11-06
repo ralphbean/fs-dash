@@ -77,6 +77,14 @@ const activityQuery = `query($owner: String!, $name: String!, $number: Int!) {
   }
 }`
 
+const lastTouchedQuery = `query($owner: String!, $name: String!, $number: Int!) {
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $number) {
+      timelineItems { updatedAt }
+    }
+  }
+}`
+
 type Enricher struct {
 	CLI string
 	Now func() time.Time
@@ -89,6 +97,9 @@ type graphPage struct {
 		} `json:"viewer"`
 		Repository *struct {
 			PullRequest *struct {
+				TimelineItems struct {
+					UpdatedAt time.Time `json:"updatedAt"`
+				} `json:"timelineItems"`
 				Reviews struct {
 					Nodes []struct {
 						DatabaseID int64 `json:"databaseId"`
@@ -225,9 +236,17 @@ func (e Enricher) FetchField(ctx context.Context, key domain.FieldKey) (any, dom
 	if e.Now != nil {
 		now = e.Now()
 	}
-	value, err := fieldValue(key.Name, page.Data.Viewer.Login, pr, now)
-	if err != nil {
-		return nil, domain.Provenance{}, err
+	var value any
+	if key.Name == "last_touched" {
+		if pr.TimelineItems.UpdatedAt.IsZero() {
+			return nil, domain.Provenance{}, &domain.FetchError{Kind: domain.ErrorTransient, Message: "GitHub timeline timestamp unavailable"}
+		}
+		value = domain.TimelineActivity{UpdatedAt: pr.TimelineItems.UpdatedAt}
+	} else {
+		value, err = fieldValue(key.Name, page.Data.Viewer.Login, pr, now)
+		if err != nil {
+			return nil, domain.Provenance{}, err
+		}
 	}
 	return value, domain.Provenance{Source: "github", FetchedAt: now, Version: now.Format(time.RFC3339Nano), FreshUntil: now.Add(fieldFreshFor)}, nil
 }
@@ -239,6 +258,7 @@ var fieldQueries = map[string]string{
 	"checks":          checksQuery,
 	"review_threads":  threadQuery,
 	"activity":        activityQuery,
+	"last_touched":    lastTouchedQuery,
 }
 
 func splitRepo(repo string) (string, string, error) {
@@ -250,6 +270,9 @@ func splitRepo(repo string) (string, string, error) {
 }
 
 func fieldValue(name, viewer string, pr *struct {
+	TimelineItems struct {
+		UpdatedAt time.Time `json:"updatedAt"`
+	} `json:"timelineItems"`
 	Reviews struct {
 		Nodes []struct {
 			DatabaseID int64 `json:"databaseId"`
