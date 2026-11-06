@@ -16,6 +16,8 @@ var triageFieldNames = []string{"reviews", "review_requests", "assignees", "chec
 const maxConcurrentActivityFetches = 5
 const maxConcurrentFieldFetches = 2
 
+var tableSummaryFieldNames = []string{"checks", "reviews", "review_threads", "assignees"}
+
 func (m Model) fieldFor(pr domain.PR, name string) *domain.Field[any] {
 	return m.fields[domain.FieldKey{Item: pr.ID, Name: name, Revision: pr.HeadSHA}]
 }
@@ -172,6 +174,7 @@ func (m *Model) selectedFields(force bool) []tea.Cmd {
 	for i := len(selectedKeys) - 1; i >= 0; i-- {
 		m.promoteField(selectedKeys[i])
 	}
+	m.prioritizeQueuedFields()
 	cmds := m.startFieldFetches()
 	cmds = append(cmds, m.startActivityFetches()...)
 	return cmds
@@ -180,7 +183,9 @@ func (m *Model) selectedFields(force bool) []tea.Cmd {
 func (m *Model) discardQueuedFieldsExcept(item domain.ItemID, revision string) {
 	kept := m.fieldQueue[:0]
 	for _, key := range m.fieldQueue {
-		if key.Name == "assignees" || (key.Item == item && key.Revision == revision) {
+		keepSummary := m.isTableSummaryField(key.Name) && m.hasListedPR(key)
+		keepSelected := key.Item == item && key.Revision == revision
+		if keepSummary || keepSelected {
 			kept = append(kept, key)
 			continue
 		}
@@ -190,6 +195,156 @@ func (m *Model) discardQueuedFieldsExcept(item domain.ItemID, revision string) {
 		}
 	}
 	m.fieldQueue = kept
+}
+
+func (m Model) isTableSummaryField(name string) bool {
+	for _, summaryName := range tableSummaryFieldNames {
+		if name == summaryName {
+			return true
+		}
+	}
+	return false
+}
+
+func (m Model) hasListedPR(key domain.FieldKey) bool {
+	for _, section := range m.sections {
+		if !section.field.HasValue {
+			continue
+		}
+		for _, pr := range section.field.Value {
+			if pr.ID == key.Item && pr.HeadSHA == key.Revision {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func (m *Model) prioritizeQueuedFields() {
+	if len(m.fieldQueue) < 2 {
+		return
+	}
+	priority := make([]domain.FieldKey, 0, len(m.fieldQueue))
+	seen := make(map[domain.FieldKey]bool, len(m.fieldQueue))
+	add := func(key domain.FieldKey) {
+		if m.fieldQueued[key] && !seen[key] {
+			priority = append(priority, key)
+			seen[key] = true
+		}
+	}
+	if pr, ok := m.selectedPR(); ok {
+		for _, key := range m.fieldQueue {
+			if key.Item == pr.ID && key.Revision == pr.HeadSHA {
+				add(key)
+			}
+		}
+	}
+	for _, pr := range m.visibleRowsForPrefetch() {
+		for _, name := range tableSummaryFieldNames {
+			add(domain.FieldKey{Item: pr.ID, Name: name, Revision: pr.HeadSHA})
+		}
+	}
+	for _, key := range m.fieldQueue {
+		add(key)
+	}
+	m.fieldQueue = priority
+}
+
+func (m Model) visibleRowsForPrefetch() []domain.PR {
+	sections := m.projection()
+	type rowPosition struct {
+		pr   domain.PR
+		line int
+	}
+	var positioned []rowPosition
+	selectedLine := -1
+	contentLine := 0
+	if m.showSnoozed {
+		contentLine = 2 // Snoozed heading and table header.
+		for _, row := range sections.Snoozed {
+			if row.PR.ID == m.selected {
+				selectedLine = contentLine
+			}
+			positioned = append(positioned, rowPosition{pr: row.PR, line: contentLine})
+			contentLine++
+		}
+	} else {
+		contentLine = 2 + len(m.sections) // Review heading, repository summaries, table header.
+		for _, row := range sections.Review {
+			if row.PR.ID == m.selected {
+				selectedLine = contentLine
+			}
+			positioned = append(positioned, rowPosition{pr: row.PR, line: contentLine})
+			contentLine++
+		}
+		if len(sections.Active) > 0 {
+			contentLine += 2 // Active heading and repeated table header.
+			for _, row := range sections.Active {
+				if row.PR.ID == m.selected {
+					selectedLine = contentLine
+				}
+				positioned = append(positioned, rowPosition{pr: row.PR, line: contentLine})
+				contentLine++
+			}
+		}
+	}
+	if len(positioned) == 0 {
+		return nil
+	}
+	scope := "no repository configured"
+	if len(m.opts.Repos) > 0 {
+		scope = strings.Join(m.opts.Repos, ", ")
+	}
+	lineCount := len(m.visual.header("fs-dash · Pull requests", scope, m.width)) + 1
+	selected, hasSelected := m.selectedPR()
+	if hasSelected {
+		var selectedRow triage.Row
+		if m.showSnoozed {
+			for _, row := range sections.Snoozed {
+				if row.PR.ID == selected.ID {
+					selectedRow = row
+					break
+				}
+			}
+		} else {
+			for _, row := range sections.Review {
+				if row.PR.ID == selected.ID {
+					selectedRow = row
+					break
+				}
+			}
+			for _, row := range sections.Active {
+				if row.PR.ID == selected.ID {
+					selectedRow = row
+					break
+				}
+			}
+		}
+		lineCount += len(m.selectedContext(selected, selectedRow))
+	}
+	statusLines := 0
+	if m.status != "" {
+		statusLines++
+	}
+	if m.reminderWarning != "" {
+		statusLines++
+	}
+	available := max(1, m.height-lineCount-3-statusLines)
+	start := 0
+	if selectedLine >= 0 {
+		start = max(0, selectedLine-available/2)
+		if start+available > contentLine {
+			start = max(0, contentLine-available)
+		}
+	}
+	end := min(contentLine, start+available)
+	visible := make([]domain.PR, 0, end-start)
+	for _, row := range positioned {
+		if row.line >= start && row.line < end {
+			visible = append(visible, row.pr)
+		}
+	}
+	return visible
 }
 
 func (m *Model) promoteField(key domain.FieldKey) {
@@ -264,6 +419,20 @@ func (m *Model) enqueueListActivity(prs []domain.PR) {
 	}
 	for _, pr := range prs {
 		m.queueActivity(domain.FieldKey{Item: pr.ID, Name: "activity", Revision: pr.HeadSHA}, false, false)
+	}
+}
+
+func (m *Model) enqueueListSummaries(prs []domain.PR) {
+	if m.opts.Enricher == nil {
+		return
+	}
+	for _, pr := range prs {
+		for _, name := range []string{"checks", "reviews", "review_threads"} {
+			m.queueField(domain.FieldKey{Item: pr.ID, Name: name, Revision: pr.HeadSHA}, false)
+		}
+		if !pr.Assignees.Complete {
+			m.queueField(domain.FieldKey{Item: pr.ID, Name: "assignees", Revision: pr.HeadSHA}, false)
+		}
 	}
 }
 
@@ -389,17 +558,26 @@ func (m Model) listView() string {
 		}
 		lines = append(lines, m.visual.paint(roleAccent, m.visual.fit(filterLabel, m.width)))
 	}
-	content := make([]string, 0, len(sections.Review)+len(sections.Active)+len(sections.Snoozed)+3)
+	tableRows := make([]triage.Row, 0, len(sections.Review)+len(sections.Active)+len(sections.Snoozed))
+	if m.showSnoozed {
+		tableRows = append(tableRows, sections.Snoozed...)
+	} else {
+		tableRows = append(tableRows, sections.Review...)
+		tableRows = append(tableRows, sections.Active...)
+	}
+	columns, widths := m.tableColumns(tableRows, m.showSnoozed)
+	content := make([]string, 0, len(tableRows)+len(m.sections)+8)
 	rows := make(map[domain.ItemID]triage.Row)
 	selectedLine := -1
 	if m.showSnoozed {
 		content = append(content, m.visual.paint(roleAccent, "SNOOZED"))
+		content = append(content, m.renderTableHeader(columns, widths))
 		for _, row := range sections.Snoozed {
 			rows[row.PR.ID] = row
 			if row.PR.ID == m.selected {
 				selectedLine = len(content)
 			}
-			content = append(content, m.renderRow(row))
+			content = append(content, m.renderTableRow(row, columns, widths, m.hasSelection && row.PR.ID == m.selected))
 		}
 	} else {
 		content = append(content, m.visual.paint(roleAccent, "REVIEW · "+strings.ToUpper(m.filter.Label())))
@@ -407,21 +585,23 @@ func (m Model) listView() string {
 			state, role := m.sectionStatus(section)
 			content = append(content, m.visual.paint(roleMuted, section.repo+" · ")+m.visual.paint(role, state))
 		}
+		content = append(content, m.renderTableHeader(columns, widths))
 		for _, row := range sections.Review {
 			rows[row.PR.ID] = row
 			if row.PR.ID == m.selected {
 				selectedLine = len(content)
 			}
-			content = append(content, m.renderRow(row))
+			content = append(content, m.renderTableRow(row, columns, widths, m.hasSelection && row.PR.ID == m.selected))
 		}
 		if len(sections.Active) > 0 {
 			content = append(content, m.visual.paint(roleAccent, "ACTIVE FULLSEND AGENTS"))
+			content = append(content, m.renderTableHeader(columns, widths))
 			for _, row := range sections.Active {
 				rows[row.PR.ID] = row
 				if row.PR.ID == m.selected {
 					selectedLine = len(content)
 				}
-				content = append(content, m.renderRow(row))
+				content = append(content, m.renderTableRow(row, columns, widths, m.hasSelection && row.PR.ID == m.selected))
 			}
 		}
 	}

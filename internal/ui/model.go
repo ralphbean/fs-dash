@@ -248,9 +248,16 @@ func (m Model) active() bool {
 			return true
 		}
 	}
-	for _, f := range m.fields {
-		if f.Phase.Active() {
-			return true
+	for _, section := range m.sections {
+		for _, pr := range section.field.Value {
+			if !m.hasSelection || pr.ID != m.selected {
+				continue
+			}
+			for _, name := range []string{"checks", "reviews", "review_requests", "assignees", "review_threads"} {
+				if f := m.fieldFor(pr, name); f != nil && f.Phase.Active() {
+					return true
+				}
+			}
 		}
 	}
 	return false
@@ -282,6 +289,8 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.width, m.height = msg.Width, msg.Height
 		m.visual.compact = msg.Width < 64
+		m.prioritizeQueuedFields()
+		cmds = append(cmds, m.startFieldFetches()...)
 	case tickMsg:
 		m.tickRunning = false
 		m.frame = (m.frame + 1) % len(frames)
@@ -319,6 +328,7 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 				m.viewer = msg.viewer
 			}
 			m.ensureSelection()
+			m.enqueueListSummaries(msg.value)
 			m.enqueueListActivity(msg.value)
 			cmds = append(cmds, m.selectedFields(false)...)
 		}
@@ -332,9 +342,10 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			m.log("info", "retry-list", s.repo, s.attempts, 0, "retrying after cooldown")
 		}
 	case fieldMsg:
+		fieldSlotFreed := false
 		if msg.key.Name != "activity" && m.fieldInFlight[msg.key] == msg.generation {
 			delete(m.fieldInFlight, msg.key)
-			cmds = append(cmds, m.startFieldFetches()...)
+			fieldSlotFreed = true
 		}
 		if msg.key.Name == "activity" && m.activityInFlight[msg.key] == msg.generation {
 			delete(m.activityInFlight, msg.key)
@@ -342,6 +353,10 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		f := m.fields[msg.key]
 		if f == nil || f.Generation != msg.generation {
+			if fieldSlotFreed {
+				m.prioritizeQueuedFields()
+				cmds = append(cmds, m.startFieldFetches()...)
+			}
 			break
 		}
 		if msg.err != nil {
@@ -375,6 +390,10 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 				}
 			}
 		}
+		if fieldSlotFreed {
+			m.prioritizeQueuedFields()
+			cmds = append(cmds, m.startFieldFetches()...)
+		}
 	case fieldRetryMsg:
 		f := m.fields[msg.key]
 		if f != nil && f.Generation == msg.generation && f.Phase == domain.Cooldown && !m.opts.Clock.Now().Before(f.RetryAt) {
@@ -383,6 +402,7 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 				cmds = append(cmds, m.startActivityFetches()...)
 			} else {
 				m.queueField(msg.key, true)
+				m.prioritizeQueuedFields()
 				cmds = append(cmds, m.startFieldFetches()...)
 			}
 		}

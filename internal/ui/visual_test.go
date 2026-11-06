@@ -94,6 +94,8 @@ func TestNoColorKeepsStatusLabelsAndFocusMarker(t *testing.T) {
 	cfg.Color = "auto"
 	id := domain.ItemID{Source: "github", Host: "github.com", Repo: "owner/repo", Number: 7}
 	m := New(Options{Config: cfg, Repos: []string{"owner/repo"}, Enricher: testutil.Enricher{}})
+	next, _ := m.Update(tea.WindowSizeMsg{Width: 120, Height: 32})
+	m = next.(Model)
 	m.sections[0].field.Succeed(m.sections[0].field.Generation, []domain.PR{{ID: id, Title: "A selected pull request", HeadSHA: "head", URL: "https://github.com/owner/repo/pull/7"}}, domain.Provenance{FreshUntil: time.Now().Add(time.Hour)})
 	m.ensureSelection()
 	key := domain.FieldKey{Item: id, Name: "reviews", Revision: "head"}
@@ -107,8 +109,9 @@ func TestNoColorKeepsStatusLabelsAndFocusMarker(t *testing.T) {
 	if strings.Contains(view, "\x1b[") {
 		t.Fatalf("NO_COLOR output contains ANSI styling: %q", view)
 	}
-	for _, label := range []string{"> #7", "open", "failed"} {
-		if !strings.Contains(view, label) {
+	plain := ansi.Strip(view)
+	for _, label := range []string{"> owner/repo#7", "open", "failed"} {
+		if !strings.Contains(plain, label) {
 			t.Fatalf("no-color output lost %q: %s", label, view)
 		}
 	}
@@ -145,7 +148,7 @@ func TestPaletteAndLayoutAtCommonAndNarrowSizes(t *testing.T) {
 				t.Fatalf("%dx%d line %d wraps to %d cells: %q", size.width, size.height, n+1, width, line)
 			}
 		}
-		if !strings.Contains(plain, "> #61") {
+		if !strings.Contains(plain, "owner/repo#61") {
 			t.Fatalf("selected row is not visible after resize to %dx%d: %s", size.width, size.height, fmt.Sprint(plain))
 		}
 	}

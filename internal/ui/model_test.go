@@ -83,6 +83,99 @@ func TestListViewUsesTerminalHeight(t *testing.T) {
 	}
 }
 
+func TestBackgroundSummaryPrefetchIsBoundedAndDoesNotDelayList(t *testing.T) {
+	now := time.Now()
+	prs := make([]domain.PR, 18)
+	for i := range prs {
+		prs[i] = testUIPr(i+1, now.Add(-time.Duration(i)*time.Minute))
+		prs[i].Title = fmt.Sprintf("PR %d", i+1)
+		prs[i].Assignees = domain.AssigneeSet{Logins: []string{"me"}, Complete: true}
+	}
+	enricher := testutil.Enricher{Fn: func(context.Context, domain.FieldKey) (any, domain.Provenance, error) {
+		return nil, domain.Provenance{}, &domain.FetchError{Kind: domain.ErrorPermanent, Message: "summary failed"}
+	}}
+	m := New(Options{Config: config.Default(), Repos: []string{"owner/repo"}, Enricher: enricher})
+	next, _ := m.Update(tea.WindowSizeMsg{Width: 120, Height: 24})
+	m = next.(Model)
+	next, _ = m.Update(listMsg{repo: "owner/repo", generation: m.sections[0].field.Generation, value: prs, viewer: "me", at: now})
+	m = next.(Model)
+	if m.sections[0].field.Phase != domain.Ready || !strings.Contains(m.View(), "owner/repo#1") {
+		t.Fatalf("list did not render before enrichment finished: %s", m.View())
+	}
+	if got := len(m.fieldInFlight); got != maxConcurrentFieldFetches {
+		t.Fatalf("summary concurrency = %d, want cap %d", got, maxConcurrentFieldFetches)
+	}
+	if got := len(m.activityInFlight); got > maxConcurrentActivityFetches {
+		t.Fatalf("activity concurrency = %d, exceeds cap %d", got, maxConcurrentActivityFetches)
+	}
+	last := prs[len(prs)-1]
+	for _, name := range []string{"checks", "reviews", "review_threads"} {
+		key := domain.FieldKey{Item: last.ID, Name: name, Revision: last.HeadSHA}
+		if !m.fieldQueued[key] {
+			t.Errorf("off-screen PR summary %q was not queued", name)
+		}
+	}
+
+	var reviewKey domain.FieldKey
+	for key := range m.fieldInFlight {
+		if key.Name == "reviews" {
+			reviewKey = key
+			break
+		}
+	}
+	if reviewKey.Name == "" {
+		t.Fatal("selected PR review summary was not started")
+	}
+	generation := m.fieldInFlight[reviewKey]
+	failed := m.fetchField(reviewKey, generation, m.fieldAttempts[reviewKey])()
+	next, _ = m.Update(failed)
+	m = next.(Model)
+	if field := m.fields[reviewKey]; field == nil || field.Phase != domain.Failed {
+		t.Fatalf("terminal summary failure did not settle: %+v", field)
+	}
+	if text, _ := m.reviewCell(prs[0]); text != "failed" {
+		t.Fatalf("failed review summary rendered as %q", text)
+	}
+}
+
+func TestBackgroundPrefetchPromotesVisibleRowsAheadOfOffscreenRows(t *testing.T) {
+	now := time.Now()
+	prs := make([]domain.PR, 24)
+	for i := range prs {
+		prs[i] = testUIPr(i+1, now.Add(-time.Duration(i)*time.Minute))
+		prs[i].Assignees = domain.AssigneeSet{Logins: []string{"me"}, Complete: true}
+	}
+	m := New(Options{Config: config.Default(), Repos: []string{"owner/repo"}})
+	m.width, m.height, m.viewer = 100, 12, "me"
+	m.sections[0].field.Succeed(m.sections[0].field.Generation, prs, domain.Provenance{Version: "list-v1", FreshUntil: now.Add(time.Hour)})
+	m.selected, m.hasSelection = prs[12].ID, true
+	m.opts.Enricher = testutil.Enricher{}
+	m.enqueueListSummaries(prs)
+	visibleRows := m.visibleRowsForPrefetch()
+	if len(visibleRows) == 0 || len(visibleRows) >= len(prs) {
+		t.Fatalf("expected a partial visible viewport, got %d of %d rows", len(visibleRows), len(prs))
+	}
+	visible := make(map[domain.ItemID]bool, len(visibleRows))
+	for _, pr := range visibleRows {
+		visible[pr.ID] = true
+	}
+	if !visible[m.selected] {
+		t.Fatalf("selected row %v is outside calculated viewport: %+v", m.selected, visibleRows)
+	}
+	m.prioritizeQueuedFields()
+	lastVisible, firstOffscreen := -1, len(m.fieldQueue)
+	for i, key := range m.fieldQueue {
+		if visible[key.Item] {
+			lastVisible = i
+		} else if i < firstOffscreen {
+			firstOffscreen = i
+		}
+	}
+	if lastVisible < 0 || firstOffscreen == len(m.fieldQueue) || lastVisible >= firstOffscreen {
+		t.Fatalf("visible summary queue is not ahead of off-screen work: visible through %d, off-screen starts %d", lastVisible, firstOffscreen)
+	}
+}
+
 func TestSelectedTriageFieldsFailIndependently(t *testing.T) {
 	id := domain.ItemID{Source: "github", Host: "github.com", Repo: "one/repo", Number: 1}
 	m := New(Options{Config: config.Default(), Repos: []string{"one/repo"}, Enricher: testutil.Enricher{Fn: func(context.Context, domain.FieldKey) (any, domain.Provenance, error) {
@@ -146,7 +239,7 @@ func TestReviewFilterIncludesIncompleteRowsAsPending(t *testing.T) {
 		t.Fatalf("review filter rows = %+v", sections.Review)
 	}
 	view := m.View()
-	if !strings.Contains(view, "REVIEW REQUESTED FROM ME") || !strings.Contains(view, "filter pending") {
+	if !strings.Contains(view, "REVIEW REQUESTED FROM ME") || !strings.Contains(view, "1 pending") {
 		t.Fatalf("filter or pending state missing: %s", view)
 	}
 }

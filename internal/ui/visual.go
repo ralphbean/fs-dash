@@ -37,13 +37,16 @@ type visualTheme struct {
 	renderer *lipgloss.Renderer
 	colors   map[visualRole]lipgloss.Color
 	compact  bool
+	noColor  bool
 }
 
 func newVisualTheme(cfg config.Config) visualTheme {
 	renderer := lipgloss.NewRenderer(os.Stdout)
-	if cfg.Color == "never" {
-		renderer.SetColorProfile(termenv.Ascii)
-	} else if _, noColor := os.LookupEnv("NO_COLOR"); noColor {
+	noColor := cfg.Color == "never"
+	if _, noColorEnv := os.LookupEnv("NO_COLOR"); noColorEnv {
+		noColor = true
+	}
+	if noColor {
 		renderer.SetColorProfile(termenv.Ascii)
 	}
 
@@ -85,7 +88,7 @@ func newVisualTheme(cfg config.Config) visualTheme {
 			roleSurface:     "#e2e8f0",
 		}
 	}
-	return visualTheme{renderer: renderer, colors: palette}
+	return visualTheme{renderer: renderer, colors: palette, noColor: noColor}
 }
 
 func (t visualTheme) style(role visualRole) lipgloss.Style {
