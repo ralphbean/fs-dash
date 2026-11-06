@@ -72,6 +72,72 @@ func TestClassifyActivityRequiresTrustedCurrentStatus(t *testing.T) {
 	}
 }
 
+func TestClassifyActivityTracksConcurrentRunsIndependently(t *testing.T) {
+	now := time.Date(2026, 11, 6, 17, 0, 0, 0, time.UTC)
+	codeStarted := now.Add(-5 * time.Minute)
+	reviewStarted := now.Add(-2 * time.Minute)
+	comments := []activityComment{
+		{Body: "<!-- fullsend:agent-status:run-code -->\n🤖 Code · Started", CreatedAt: codeStarted, URL: "https://github.com/owner/repo/pull/1#issuecomment-1", Author: "fullsend-ai-coder"},
+		{Body: "<!-- fullsend:agent-status:run-review -->\n🤖 Review · Started\n[View workflow run](https://github.com/owner/repo/actions/runs/22)", CreatedAt: reviewStarted, URL: "https://github.com/owner/repo/pull/1#issuecomment-2", Author: "fullsend-ai-review"},
+	}
+
+	got := classifyActivity(comments, true, now)
+	if got.State != domain.ActivityActive || len(got.Runs) != 2 || !got.RunsComplete {
+		t.Fatalf("concurrent runs = %+v", got)
+	}
+	if got.Runs[0].RunID != "run-code" || got.Runs[0].Name != "Code" || !got.Runs[0].StartedAt.Equal(codeStarted) {
+		t.Errorf("first run = %+v", got.Runs[0])
+	}
+	if got.Runs[1].RunID != "run-review" || got.Runs[1].Name != "Review" || got.Runs[1].WorkflowURL != "https://github.com/owner/repo/actions/runs/22" {
+		t.Errorf("second run = %+v", got.Runs[1])
+	}
+
+	comments = append(comments, activityComment{
+		Body:      "<!-- fullsend:agent-status:run-code -->\n<!-- fullsend:status:terminal -->",
+		CreatedAt: now.Add(-time.Minute),
+		UpdatedAt: now.Add(-time.Minute),
+		Author:    "fullsend-ai-coder",
+	})
+	got = classifyActivity(comments, true, now)
+	if got.State != domain.ActivityActive || len(got.Runs) != 1 || got.Runs[0].RunID != "run-review" {
+		t.Fatalf("terminal status for one run affected another run: %+v", got)
+	}
+}
+
+func TestClassifyActivityOmitsStaleRunsAndKeepsMissingWorkflowLinks(t *testing.T) {
+	now := time.Date(2026, 11, 6, 17, 0, 0, 0, time.UTC)
+	comments := []activityComment{
+		{Body: "<!-- fullsend:agent-status:stale -->\n🤖 Code · Started", CreatedAt: now.Add(-7 * time.Hour), Author: "fullsend-ai-coder"},
+		{Body: "<!-- fullsend:agent-status:no-link -->\n🤖 Triage · Started", CreatedAt: now.Add(-time.Minute), Author: "fullsend-ai-triage"},
+	}
+	got := classifyActivity(comments, true, now)
+	if got.State != domain.ActivityActive || len(got.Runs) != 1 {
+		t.Fatalf("stale run was not omitted: %+v", got)
+	}
+	if got.Runs[0].RunID != "no-link" || got.Runs[0].Name != "Triage" || got.Runs[0].WorkflowURL != "" {
+		t.Fatalf("run without workflow link = %+v", got.Runs[0])
+	}
+}
+
+func TestClassifyActivityPreservesIncompleteHistoryAndRejectsUntrustedAuthors(t *testing.T) {
+	now := time.Date(2026, 11, 6, 17, 0, 0, 0, time.UTC)
+	active := activityComment{
+		Body:      "<!-- fullsend:agent-status:known -->\n🤖 Code · Started",
+		CreatedAt: now.Add(-time.Minute),
+		Author:    "fullsend-ai-coder",
+	}
+	got := classifyActivity([]activityComment{active}, false, now)
+	if got.State != domain.ActivityActive || len(got.Runs) != 1 || got.RunsComplete || !got.Complete {
+		t.Fatalf("partial run history = %+v", got)
+	}
+
+	untrusted := activityComment{Body: active.Body, CreatedAt: active.CreatedAt, Author: "untrusted-user"}
+	got = classifyActivity([]activityComment{untrusted}, true, now)
+	if got.State != domain.ActivityInactive || !got.Complete || len(got.Runs) != 0 {
+		t.Fatalf("untrusted status comment affected activity: %+v", got)
+	}
+}
+
 func TestClassifyActivityLatestTerminalWinsAndFreshnessIsExplicit(t *testing.T) {
 	now := time.Date(2026, 11, 3, 15, 0, 0, 0, time.UTC)
 	old := activityComment{Body: "<!-- fullsend:agent-status:old -->", CreatedAt: now.Add(-7 * time.Hour), URL: "old", Author: "fullsend-ai-review"}
