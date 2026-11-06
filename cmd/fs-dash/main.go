@@ -9,6 +9,7 @@ import (
 	"github.com/fullsend-ai/fs-dash/internal/config"
 	"github.com/fullsend-ai/fs-dash/internal/github"
 	"github.com/fullsend-ai/fs-dash/internal/localcmd"
+	"github.com/fullsend-ai/fs-dash/internal/preferences"
 	"github.com/fullsend-ai/fs-dash/internal/reminder"
 	"github.com/fullsend-ai/fs-dash/internal/ui"
 )
@@ -51,17 +52,22 @@ func main() {
 		fmt.Fprintln(os.Stderr, "fs-dash:", err)
 		os.Exit(2)
 	}
-	reminderPath, reminderErr := reminder.DefaultPath()
-	var reminderStore *reminder.FileStore
-	if reminderErr == nil {
-		reminderStore = reminder.NewFileStore(reminderPath)
-		reminderErr = reminderStore.Load()
+	triagePath, triageErr := reminder.DefaultPath()
+	var triageFileStore *reminder.FileStore
+	if triageErr == nil {
+		triageFileStore = reminder.NewFileStore(triagePath)
+		triageErr = triageFileStore.Load()
 	}
-	var store reminder.Store = reminder.NewMemoryStore()
-	if reminderStore != nil {
-		store = reminderStore
+	var triageStore reminder.Store = reminder.NewMemoryStore()
+	if triageFileStore != nil {
+		triageStore = triageFileStore
 	}
-	options := ui.Options{Config: cfg, Repos: repos, Lister: github.PRLister{}, Enricher: github.Enricher{}, Runner: localcmd.Runner{}, Reminders: store, ReminderLoadError: reminderErr}
+	preferencesPath, preferenceErr := preferences.DefaultPath()
+	var preferenceStore preferences.Store
+	if preferenceErr == nil {
+		preferenceStore = preferences.NewFileStore(preferencesPath)
+	}
+	options := ui.Options{Config: cfg, Repos: repos, Lister: github.PRLister{}, Enricher: github.Enricher{}, Runner: localcmd.Runner{}, Reminders: triageStore, ReminderLoadError: triageErr, DisplayPreferences: preferenceStore, PreferenceLoadError: preferenceErr}
 	if _, err := tea.NewProgram(ui.New(options), tea.WithAltScreen()).Run(); err != nil {
 		fmt.Fprintln(os.Stderr, "fs-dash:", err)
 		os.Exit(1)

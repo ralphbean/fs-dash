@@ -13,6 +13,32 @@ import (
 
 type tableColumn string
 type tableAlignment int
+type tableDisplayMode int
+type tableCellKind int
+
+const (
+	tableDisplayText tableDisplayMode = iota
+	tableDisplayEmoji
+)
+
+const (
+	cellText tableCellKind = iota
+	cellPending
+	cellLoading
+	cellStale
+	cellFailed
+	cellUnknown
+	cellChecksFailed
+	cellChecksRunning
+	cellChecksPartial
+	cellChecksNone
+	cellChecksPass
+	cellReviewChanges
+	cellReviewApproved
+	cellReviewCommented
+	cellReviewAwaiting
+	cellThreadCount
+)
 
 const (
 	columnStar      tableColumn = "star"
@@ -32,19 +58,94 @@ const (
 )
 
 type tableCell struct {
-	text   string
-	role   visualRole
-	url    string
-	prefix string
+	kind       tableCellKind
+	text       string
+	indicator  string
+	count      int
+	incomplete bool
+	role       visualRole
+	url        string
+	prefix     string
 }
 
 type tableColumnSpec struct {
-	column tableColumn
-	label  string
-	min    int
-	max    int
-	align  tableAlignment
-	flex   bool
+	column     tableColumn
+	label      string
+	emojiLabel string
+	min        int
+	max        int
+	align      tableAlignment
+	flex       bool
+}
+
+func (cell tableCell) render(mode tableDisplayMode) string {
+	if mode == tableDisplayEmoji {
+		switch cell.kind {
+		case cellPending:
+			return "⏳"
+		case cellLoading:
+			if cell.indicator != "" {
+				return cell.indicator
+			}
+			return "🔄"
+		case cellStale:
+			return "🕰️"
+		case cellFailed:
+			return "❌"
+		case cellUnknown:
+			return "❔"
+		case cellChecksFailed:
+			return fmt.Sprintf("❌%d", cell.count)
+		case cellChecksRunning:
+			return fmt.Sprintf("🔄%d", cell.count)
+		case cellChecksPartial:
+			return "⚠️"
+		case cellChecksNone:
+			return "➖"
+		case cellChecksPass, cellReviewApproved:
+			return "✅"
+		case cellReviewChanges:
+			return "🛑"
+		case cellReviewCommented:
+			return "💬"
+		case cellReviewAwaiting:
+			return "💤"
+		case cellThreadCount:
+			text := fmt.Sprint(cell.count)
+			if cell.incomplete {
+				text += "+"
+			}
+			return text
+		}
+	}
+	switch cell.kind {
+	case cellChecksFailed:
+		return fmt.Sprintf("fail %d", cell.count)
+	case cellChecksRunning:
+		return fmt.Sprintf("running %d", cell.count)
+	case cellChecksPartial:
+		return "partial"
+	case cellChecksNone:
+		return "none"
+	case cellChecksPass:
+		return "pass"
+	case cellReviewChanges:
+		return "changes"
+	case cellReviewApproved:
+		return "approved"
+	case cellReviewCommented:
+		return "commented"
+	case cellReviewAwaiting:
+		return "awaiting"
+	case cellThreadCount:
+		text := fmt.Sprint(cell.count)
+		if cell.incomplete {
+			text += "+"
+		}
+		return text
+	default:
+		return cell.text
+	}
 }
 
 func listTableSpecs(withWake bool) []tableColumnSpec {
@@ -55,14 +156,33 @@ func listTableSpecs(withWake bool) []tableColumnSpec {
 		{column: columnAuthor, label: "Author", min: 8, max: 18, align: alignLeft},
 		{column: columnAssignees, label: "Assignees", min: 10, max: 22, align: alignLeft},
 		{column: columnUpdated, label: "Updated", min: 13, max: 13, align: alignRight},
-		{column: columnChecks, label: "Checks", min: 9, max: 9, align: alignCenter},
-		{column: columnReview, label: "Review", min: 12, max: 12, align: alignCenter},
-		{column: columnThreads, label: "Threads", min: 7, max: 7, align: alignRight},
+		{column: columnChecks, label: "Checks", emojiLabel: "🧪", min: 9, max: 9, align: alignCenter},
+		{column: columnReview, label: "Review", emojiLabel: "👀", min: 12, max: 12, align: alignCenter},
+		{column: columnThreads, label: "Threads", emojiLabel: "🧵", min: 7, max: 7, align: alignRight},
 	}
 	if withWake {
 		specs = append(specs, tableColumnSpec{column: columnWake, label: "Wake", min: 16, max: 16, align: alignRight})
 	}
 	return specs
+}
+
+func (spec tableColumnSpec) displayLabel(mode tableDisplayMode) string {
+	if mode == tableDisplayEmoji && spec.emojiLabel != "" {
+		return spec.emojiLabel
+	}
+	return spec.label
+}
+
+func textCell(text string, role visualRole) tableCell {
+	return tableCell{kind: cellText, text: text, role: role}
+}
+
+func stateCell(kind tableCellKind, text string, role visualRole) tableCell {
+	return tableCell{kind: kind, text: text, role: role}
+}
+
+func loadingCell(text, indicator string, role visualRole) tableCell {
+	return tableCell{kind: cellLoading, text: text, indicator: indicator, role: role}
 }
 
 func (m Model) tableCellFor(row triage.Row, column tableColumn) tableCell {
@@ -92,14 +212,11 @@ func (m Model) tableCellFor(row triage.Row, column tableColumn) tableCell {
 	case columnUpdated:
 		return m.updatedCell(row.PR)
 	case columnChecks:
-		text, role := m.checksCell(row.PR)
-		return tableCell{text: text, role: role}
+		return m.checksCell(row.PR)
 	case columnReview:
-		text, role := m.reviewCell(row.PR)
-		return tableCell{text: text, role: role}
+		return m.reviewValue(row.PR)
 	case columnThreads:
-		text, role := m.threadsCell(row.PR)
-		return tableCell{text: text, role: role}
+		return m.threadsCell(row.PR)
 	case columnWake:
 		if row.SnoozedUntil.IsZero() {
 			return tableCell{text: "—", role: roleMuted}
@@ -167,66 +284,71 @@ func (m Model) assigneeCell(pr domain.PR) tableCell {
 	return tableCell{text: text, role: role}
 }
 
-func (m Model) checksCell(pr domain.PR) (string, visualRole) {
+func (m Model) checksCell(pr domain.PR) tableCell {
 	f := m.fieldFor(pr, "checks")
 	if f == nil {
-		return "pending", roleUnrequested
+		return stateCell(cellPending, "pending", roleUnrequested)
 	}
 	if f.Phase.Active() {
-		return m.loadingSummary(pr), rolePending
+		return loadingCell(m.loadingSummary(pr), m.spinner(), rolePending)
 	}
 	if f.Phase == domain.Failed || f.Phase == domain.Cooldown {
-		return "failed", roleFailure
+		return stateCell(cellFailed, "failed", roleFailure)
 	}
 	if !f.HasValue {
-		return "pending", roleUnrequested
+		return stateCell(cellPending, "pending", roleUnrequested)
 	}
 	if f.Stale(m.opts.Clock.Now()) {
-		return "stale", roleStale
+		return stateCell(cellStale, "stale", roleStale)
 	}
 	summary, ok := f.Value.(domain.CheckSummary)
 	if !ok {
-		return "unknown", roleMuted
+		return stateCell(cellUnknown, "unknown", roleMuted)
 	}
 	if summary.Failed > 0 {
-		return fmt.Sprintf("fail %d", summary.Failed), roleFailure
+		return tableCell{kind: cellChecksFailed, count: summary.Failed, role: roleFailure}
 	}
 	if summary.Pending > 0 {
-		return fmt.Sprintf("running %d", summary.Pending), rolePending
+		return tableCell{kind: cellChecksRunning, count: summary.Pending, role: rolePending}
 	}
 	if !summary.Complete {
-		return "partial", roleStale
+		return stateCell(cellChecksPartial, "partial", roleStale)
 	}
 	if summary.Total == 0 {
-		return "none", roleMuted
+		return stateCell(cellChecksNone, "none", roleMuted)
 	}
-	return "pass", roleSuccess
+	return stateCell(cellChecksPass, "pass", roleSuccess)
 }
 
 func (m Model) reviewCell(pr domain.PR) (string, visualRole) {
+	cell := m.reviewValue(pr)
+	return cell.render(tableDisplayText), cell.role
+}
+
+func (m Model) reviewValue(pr domain.PR) tableCell {
 	f := m.fieldFor(pr, "reviews")
 	if f == nil {
-		return "pending", roleUnrequested
+		return stateCell(cellPending, "pending", roleUnrequested)
 	}
 	if f.Phase.Active() {
-		return m.loadingSummary(pr), rolePending
+		return loadingCell(m.loadingSummary(pr), m.spinner(), rolePending)
 	}
 	if f.Phase == domain.Failed || f.Phase == domain.Cooldown {
-		return "failed", roleFailure
+		return stateCell(cellFailed, "failed", roleFailure)
 	}
 	if !f.HasValue {
-		return "pending", roleUnrequested
+		return stateCell(cellPending, "pending", roleUnrequested)
 	}
 	if f.Stale(m.opts.Clock.Now()) {
-		return "stale", roleStale
+		return stateCell(cellStale, "stale", roleStale)
 	}
 	reviews, ok := f.Value.(domain.ReviewSet)
 	if !ok {
-		return "unknown", roleMuted
+		return stateCell(cellUnknown, "unknown", roleMuted)
 	}
 	effective, known := domain.EffectiveReviews(reviews.Reviews, reviews.Complete, f.Provenance.Version)
 	if !known {
-		return "pending", rolePending
+		return stateCell(cellPending, "pending", rolePending)
 	}
 	approved, changesRequested, commented := false, false, false
 	for _, review := range effective {
@@ -240,48 +362,46 @@ func (m Model) reviewCell(pr domain.PR) (string, visualRole) {
 		}
 	}
 	if changesRequested {
-		return "changes", roleFailure
+		return stateCell(cellReviewChanges, "changes", roleFailure)
 	}
 	if approved {
-		return "approved", roleSuccess
+		return stateCell(cellReviewApproved, "approved", roleSuccess)
 	}
 	if commented {
-		return "commented", roleAccent
+		return stateCell(cellReviewCommented, "commented", roleAccent)
 	}
-	return "awaiting", roleMuted
+	return stateCell(cellReviewAwaiting, "awaiting", roleMuted)
 }
 
-func (m Model) threadsCell(pr domain.PR) (string, visualRole) {
+func (m Model) threadsCell(pr domain.PR) tableCell {
 	f := m.fieldFor(pr, "review_threads")
 	if f == nil {
-		return "pending", roleUnrequested
+		return stateCell(cellPending, "pending", roleUnrequested)
 	}
 	if f.Phase.Active() {
-		return m.loadingSummary(pr), rolePending
+		return loadingCell(m.loadingSummary(pr), m.spinner(), rolePending)
 	}
 	if f.Phase == domain.Failed || f.Phase == domain.Cooldown {
-		return "failed", roleFailure
+		return stateCell(cellFailed, "failed", roleFailure)
 	}
 	if !f.HasValue {
-		return "pending", roleUnrequested
+		return stateCell(cellPending, "pending", roleUnrequested)
 	}
 	if f.Stale(m.opts.Clock.Now()) {
-		return "stale", roleStale
+		return stateCell(cellStale, "stale", roleStale)
 	}
 	summary, ok := f.Value.(domain.ThreadSummary)
 	if !ok {
-		return "unknown", roleMuted
+		return stateCell(cellUnknown, "unknown", roleMuted)
 	}
-	text := fmt.Sprint(summary.Unresolved)
 	role := roleMuted
 	if summary.Unresolved > 0 {
 		role = roleWarning
 	}
 	if !summary.Complete {
-		text += "+"
 		role = roleStale
 	}
-	return text, role
+	return tableCell{kind: cellThreadCount, count: summary.Unresolved, incomplete: !summary.Complete, role: role}
 }
 
 func (m Model) loadingSummary(pr domain.PR) string {
@@ -289,6 +409,20 @@ func (m Model) loadingSummary(pr domain.PR) string {
 		return m.spinner() + " loading"
 	}
 	return "loading"
+}
+
+func (m Model) tableDisplayMode() tableDisplayMode {
+	if m.emojiMode {
+		return tableDisplayEmoji
+	}
+	return tableDisplayText
+}
+
+func (m Model) tableModeHint() string {
+	if m.emojiMode {
+		return "e text"
+	}
+	return "e emoji"
 }
 
 func relativeTime(now, at time.Time) string {
@@ -346,10 +480,16 @@ func (m Model) tableColumns(rows []triage.Row, withWake bool) ([]tableColumnSpec
 	widths := make([]int, len(specs))
 	for i, spec := range specs {
 		width := spec.min
-		if spec.column == columnPR || spec.column == columnAuthor || spec.column == columnAssignees {
+		if m.emojiMode && spec.emojiLabel != "" {
+			width = lipgloss.Width(spec.emojiLabel)
 			for _, row := range rows {
 				cell := m.tableCellFor(row, spec.column)
-				width = max(width, lipgloss.Width(cell.text))
+				width = max(width, lipgloss.Width(cell.render(tableDisplayEmoji)))
+			}
+		} else if spec.column == columnPR || spec.column == columnAuthor || spec.column == columnAssignees {
+			for _, row := range rows {
+				cell := m.tableCellFor(row, spec.column)
+				width = max(width, lipgloss.Width(cell.render(tableDisplayText)))
 			}
 			width = min(width, spec.max)
 			width = max(width, spec.min)
@@ -436,7 +576,7 @@ func tableWidth(widths []int, specs []tableColumnSpec, titleWidth int) int {
 func (m Model) renderTableHeader(specs []tableColumnSpec, widths []int) string {
 	cells := make([]tableCell, len(specs))
 	for i, spec := range specs {
-		cells[i] = tableCell{text: spec.label, role: roleAccent}
+		cells[i] = textCell(spec.displayLabel(m.tableDisplayMode()), roleAccent)
 	}
 	return m.renderTableCells(cells, specs, widths, false)
 }
@@ -456,7 +596,7 @@ func (m Model) renderTableCells(cells []tableCell, specs []tableColumnSpec, widt
 	parts := make([]string, 0, len(cells)*2-1)
 	for i, cell := range cells {
 		prefixWidth := lipgloss.Width(cell.prefix)
-		text := ansi.Truncate(cell.text, max(0, widths[i]-prefixWidth), "…")
+		text := ansi.Truncate(cell.render(m.tableDisplayMode()), max(0, widths[i]-prefixWidth), "…")
 		padding := max(0, widths[i]-prefixWidth-lipgloss.Width(text))
 		left, right := 0, padding
 		switch specs[i].align {

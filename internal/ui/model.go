@@ -13,22 +13,25 @@ import (
 	"github.com/fullsend-ai/fs-dash/internal/domain"
 	"github.com/fullsend-ai/fs-dash/internal/fetch"
 	"github.com/fullsend-ai/fs-dash/internal/ports"
+	"github.com/fullsend-ai/fs-dash/internal/preferences"
 	"github.com/fullsend-ai/fs-dash/internal/reminder"
 	"github.com/fullsend-ai/fs-dash/internal/triage"
 )
 
 type Options struct {
-	Config            config.Config
-	Repos             []string
-	Lister            ports.PRLister
-	Enricher          ports.Enricher
-	Scheduler         *fetch.Scheduler
-	ActivityScheduler *fetch.Scheduler
-	Runner            ports.CommandRunner
-	Logs              *diag.Buffer
-	Clock             ports.Clock
-	Reminders         reminder.Store
-	ReminderLoadError error
+	Config              config.Config
+	Repos               []string
+	Lister              ports.PRLister
+	Enricher            ports.Enricher
+	Scheduler           *fetch.Scheduler
+	ActivityScheduler   *fetch.Scheduler
+	Runner              ports.CommandRunner
+	Logs                *diag.Buffer
+	Clock               ports.Clock
+	Reminders           reminder.Store
+	ReminderLoadError   error
+	DisplayPreferences  preferences.Store
+	PreferenceLoadError error
 }
 type realClock struct{}
 
@@ -57,6 +60,7 @@ type Model struct {
 	fieldQueued                     map[domain.FieldKey]bool
 	fieldInFlight                   map[domain.FieldKey]uint64
 	filter                          triage.Filter
+	emojiMode                       bool
 	viewer                          string
 	wakeTickRunning                 bool
 	wakeGeneration                  uint64
@@ -127,10 +131,20 @@ func New(opts Options) Model {
 	if opts.Reminders == nil {
 		opts.Reminders = reminder.NewMemoryStore()
 	}
-	m := Model{opts: opts, mode: "list", logLevel: "all", width: 100, height: 30, fields: map[domain.FieldKey]*domain.Field[any]{}, fieldAttempts: map[domain.FieldKey]int{}, fieldQueued: map[domain.FieldKey]bool{}, fieldInFlight: map[domain.FieldKey]uint64{}, activityQueued: map[domain.FieldKey]bool{}, activityInFlight: map[domain.FieldKey]uint64{}, filter: triage.FilterAuthored, visual: newVisualTheme(opts.Config)}
+	m := Model{opts: opts, mode: "list", logLevel: "all", width: 100, height: 30, fields: map[domain.FieldKey]*domain.Field[any]{}, fieldAttempts: map[domain.FieldKey]int{}, fieldQueued: map[domain.FieldKey]bool{}, fieldInFlight: map[domain.FieldKey]uint64{}, activityQueued: map[domain.FieldKey]bool{}, activityInFlight: map[domain.FieldKey]uint64{}, filter: triage.FilterAuthored, emojiMode: true, visual: newVisualTheme(opts.Config)}
 	m.visual.compact = m.width < 64
 	if opts.ReminderLoadError != nil {
-		m.reminderWarning = "Local reminders: " + opts.ReminderLoadError.Error()
+		m.reminderWarning = "Local triage state: " + opts.ReminderLoadError.Error()
+	}
+	if opts.DisplayPreferences != nil {
+		if emojiMode, err := opts.DisplayPreferences.Load(); err != nil {
+			m.status = "Local preferences: " + err.Error()
+		} else {
+			m.emojiMode = emojiMode
+		}
+	}
+	if opts.PreferenceLoadError != nil {
+		m.status = "Local preferences: " + opts.PreferenceLoadError.Error()
 	}
 	for _, repo := range opts.Repos {
 		f := domain.NewField[[]domain.PR]()
@@ -249,9 +263,6 @@ func (m Model) active() bool {
 	}
 	for _, section := range m.sections {
 		for _, pr := range section.field.Value {
-			if !m.hasSelection || pr.ID != m.selected {
-				continue
-			}
 			for _, name := range []string{"checks", "reviews", "review_requests", "assignees", "review_threads"} {
 				if f := m.fieldFor(pr, name); f != nil && f.Phase.Active() {
 					return true
@@ -525,6 +536,19 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 					m.ensureSelection()
 				}
 			}
+		case "e":
+			if m.mode == "list" {
+				m.emojiMode = !m.emojiMode
+				if m.opts.DisplayPreferences != nil {
+					if err := m.opts.DisplayPreferences.SaveEmojiMode(m.emojiMode); err != nil {
+						m.status = "Display preference save failed: " + err.Error()
+					} else if strings.HasPrefix(m.status, "Local preferences:") || strings.HasPrefix(m.status, "Display preference save failed:") {
+						m.status = ""
+					}
+				} else if m.opts.PreferenceLoadError != nil {
+					m.status = "Display preference not saved: " + m.opts.PreferenceLoadError.Error()
+				}
+			}
 		case "z":
 			if m.hasSelection {
 				m.mode = "snooze"
@@ -635,7 +659,7 @@ func (m Model) helpView() string {
 		keys = append(keys, key)
 	}
 	sort.Strings(keys)
-	content := []string{"j/k or arrows  move selection", "h/l            previous/next filter", "enter          PR details", "esc            back", "s              toggle local star", "z              choose snooze duration", "u              unsnooze selected PR", "r              refresh all sections", "L              log console", "?              toggle help", "q              quit"}
+	content := []string{"j/k or arrows  move selection", "h/l            previous/next filter", "e              toggle emoji/text table labels", "enter          PR details", "esc            back", "s              toggle local star", "z              choose snooze duration", "u              unsnooze selected PR", "r              refresh all sections", "L              log console", "?              toggle help", "q              quit"}
 	for _, key := range keys {
 		content = append(content, fmt.Sprintf("%s              %s", key, m.opts.Config.Bindings[key].Executable))
 	}

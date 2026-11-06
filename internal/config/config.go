@@ -108,7 +108,7 @@ func (c Config) Validate() error {
 		if key == "" || strings.ContainsAny(key, " \t\n") {
 			return fmt.Errorf("invalid binding key %q", key)
 		}
-		if key == "q" || key == "?" || key == "r" || key == "L" || key == "ctrl+c" || key == "h" || key == "l" || key == "s" || key == "z" || key == "u" {
+		if key == "q" || key == "?" || key == "r" || key == "L" || key == "ctrl+c" || key == "h" || key == "l" || key == "s" || key == "z" || key == "u" || key == "e" {
 			return fmt.Errorf("binding key %q is reserved", key)
 		}
 		if binding.Executable == "" {

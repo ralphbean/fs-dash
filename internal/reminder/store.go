@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/fullsend-ai/fs-dash/internal/domain"
+	"github.com/fullsend-ai/fs-dash/internal/statepath"
 )
 
 const fileVersion = 1
@@ -85,17 +86,7 @@ func NewFileStore(path string) *FileStore {
 }
 
 func DefaultPath() (string, error) {
-	base := os.Getenv("XDG_STATE_HOME")
-	if base == "" {
-		home, err := os.UserHomeDir()
-		if err != nil {
-			return "", err
-		}
-		base = filepath.Join(home, ".local", "state")
-	} else if !filepath.IsAbs(base) {
-		return "", fmt.Errorf("XDG_STATE_HOME must be an absolute path")
-	}
-	return filepath.Join(base, "fs-dash", "reminders.json"), nil
+	return statepath.File("triage.json")
 }
 
 func (s *FileStore) Load() error {
@@ -106,36 +97,51 @@ func (s *FileStore) Load() error {
 	}
 	s.loaded = true
 	data, err := os.ReadFile(s.path)
+	legacy := false
 	if errors.Is(err, os.ErrNotExist) {
-		return nil
+		legacyPath := filepath.Join(filepath.Dir(s.path), "reminders.json")
+		if legacyPath == s.path {
+			return nil
+		}
+		data, err = os.ReadFile(legacyPath)
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		legacy = err == nil
 	}
 	if err != nil {
-		s.loadErr = fmt.Errorf("read local reminders: %w", err)
+		s.loadErr = fmt.Errorf("read local triage state: %w", err)
 		return s.loadErr
 	}
 	var file diskFile
 	if err := json.Unmarshal(data, &file); err != nil {
-		s.loadErr = s.preserveCorrupt(data, fmt.Errorf("parse local reminders: %w", err))
+		s.loadErr = s.preserveCorrupt(data, fmt.Errorf("parse local triage state: %w", err))
 		return s.loadErr
 	}
 	if file.Version != fileVersion {
-		s.loadErr = s.preserveCorrupt(data, fmt.Errorf("unsupported local reminder version %d", file.Version))
+		s.loadErr = s.preserveCorrupt(data, fmt.Errorf("unsupported local triage state version %d", file.Version))
 		return s.loadErr
 	}
 	entries := make(map[domain.ItemID]Entry, len(file.Entries))
 	for _, item := range file.Entries {
 		if item.Source == "" || item.Host == "" || item.Repo == "" || item.Number < 1 || (!item.Starred && item.SnoozedUntil.IsZero()) {
-			s.loadErr = s.preserveCorrupt(data, fmt.Errorf("invalid local reminder entry for %s/%s#%d", item.Host, item.Repo, item.Number))
+			s.loadErr = s.preserveCorrupt(data, fmt.Errorf("invalid local triage entry for %s/%s#%d", item.Host, item.Repo, item.Number))
 			return s.loadErr
 		}
 		id := domain.ItemID{Source: item.Source, Host: item.Host, Repo: item.Repo, Number: item.Number}
 		if _, exists := entries[id]; exists {
-			s.loadErr = s.preserveCorrupt(data, fmt.Errorf("duplicate local reminder entry for %s", id.String()))
+			s.loadErr = s.preserveCorrupt(data, fmt.Errorf("duplicate local triage entry for %s", id.String()))
 			return s.loadErr
 		}
 		entries[id] = Entry{Starred: item.Starred, SnoozedUntil: item.SnoozedUntil}
 	}
 	s.entries = entries
+	if legacy {
+		if err := s.save(entries); err != nil {
+			s.loadErr = fmt.Errorf("migrate local triage state: %w", err)
+			return s.loadErr
+		}
+	}
 	return nil
 }
 
@@ -161,10 +167,10 @@ func (s *FileStore) update(id domain.ItemID, change func(Entry) Entry) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if !s.loaded {
-		return errors.New("local reminders have not been loaded")
+		return errors.New("local triage state has not been loaded")
 	}
 	if s.loadErr != nil {
-		return fmt.Errorf("local reminders are read-only after load error: %w", s.loadErr)
+		return fmt.Errorf("local triage state is read-only after load error: %w", s.loadErr)
 	}
 	next := cloneEntries(s.entries)
 	next[id] = change(next[id])
@@ -192,7 +198,7 @@ type diskEntry struct {
 
 func (s *FileStore) save(entries map[domain.ItemID]Entry) error {
 	if err := os.MkdirAll(filepath.Dir(s.path), 0700); err != nil {
-		return fmt.Errorf("create local reminder directory: %w", err)
+		return fmt.Errorf("create local triage directory: %w", err)
 	}
 	ids := make([]domain.ItemID, 0, len(entries))
 	for id := range entries {
@@ -206,31 +212,31 @@ func (s *FileStore) save(entries map[domain.ItemID]Entry) error {
 	}
 	data, err := json.MarshalIndent(file, "", "  ")
 	if err != nil {
-		return fmt.Errorf("encode local reminders: %w", err)
+		return fmt.Errorf("encode local triage state: %w", err)
 	}
-	tmp, err := os.CreateTemp(filepath.Dir(s.path), ".reminders-*.tmp")
+	tmp, err := os.CreateTemp(filepath.Dir(s.path), ".triage-*.tmp")
 	if err != nil {
-		return fmt.Errorf("create local reminder temporary file: %w", err)
+		return fmt.Errorf("create local triage temporary file: %w", err)
 	}
 	tmpName := tmp.Name()
 	defer os.Remove(tmpName)
 	if err := tmp.Chmod(0600); err != nil {
 		_ = tmp.Close()
-		return fmt.Errorf("set local reminder permissions: %w", err)
+		return fmt.Errorf("set local triage permissions: %w", err)
 	}
 	if _, err := tmp.Write(data); err != nil {
 		_ = tmp.Close()
-		return fmt.Errorf("write local reminders: %w", err)
+		return fmt.Errorf("write local triage state: %w", err)
 	}
 	if err := tmp.Sync(); err != nil {
 		_ = tmp.Close()
-		return fmt.Errorf("sync local reminders: %w", err)
+		return fmt.Errorf("sync local triage state: %w", err)
 	}
 	if err := tmp.Close(); err != nil {
-		return fmt.Errorf("close local reminders: %w", err)
+		return fmt.Errorf("close local triage state: %w", err)
 	}
 	if err := os.Rename(tmpName, s.path); err != nil {
-		return fmt.Errorf("replace local reminders: %w", err)
+		return fmt.Errorf("replace local triage state: %w", err)
 	}
 	if dir, err := os.Open(filepath.Dir(s.path)); err == nil {
 		_ = dir.Sync()

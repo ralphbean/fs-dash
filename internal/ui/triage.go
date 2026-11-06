@@ -706,9 +706,9 @@ func (m Model) listView() string {
 	if m.status != "" {
 		lines = append(lines, m.visual.paint(roleWarning, m.visual.fit(m.status, m.width)))
 	}
-	footer := "h/l filters · j/k move · enter details · s star · z snooze · r refresh · L logs · ? help · q quit"
+	footer := m.tableModeHint() + " · h/l filters · j/k move · enter details · s star · z snooze · r refresh · L logs · ? help · q quit"
 	if m.showingSnoozed() {
-		footer = "h/l filters · j/k move · s star · z snooze · u unsnooze · L logs · ? help · q quit"
+		footer = m.tableModeHint() + " · h/l filters · j/k move · s star · z snooze · u unsnooze · L logs · ? help · q quit"
 	}
 	lines = append(lines, m.visual.footer(footer, m.width))
 	return strings.Join(lines, "\n") + "\n"

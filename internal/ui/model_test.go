@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -14,6 +15,7 @@ import (
 	"github.com/fullsend-ai/fs-dash/internal/config"
 	"github.com/fullsend-ai/fs-dash/internal/diag"
 	"github.com/fullsend-ai/fs-dash/internal/domain"
+	"github.com/fullsend-ai/fs-dash/internal/preferences"
 	"github.com/fullsend-ai/fs-dash/internal/reminder"
 	"github.com/fullsend-ai/fs-dash/internal/testutil"
 	"github.com/fullsend-ai/fs-dash/internal/triage"
@@ -145,6 +147,7 @@ func TestBackgroundSummaryPrefetchIsBoundedAndDoesNotDelayList(t *testing.T) {
 		return nil, domain.Provenance{}, &domain.FetchError{Kind: domain.ErrorPermanent, Message: "summary failed"}
 	}}
 	m := New(Options{Config: config.Default(), Repos: []string{"owner/repo"}, Enricher: enricher})
+	m.filter = triage.FilterAll
 	next, _ := m.Update(tea.WindowSizeMsg{Width: 120, Height: 24})
 	m = next.(Model)
 	next, _ = m.Update(listMsg{repo: "owner/repo", generation: m.sections[0].field.Generation, value: prs, viewer: "me", at: now})
@@ -197,6 +200,7 @@ func TestBackgroundPrefetchPromotesVisibleRowsAheadOfOffscreenRows(t *testing.T)
 	}
 	m := New(Options{Config: config.Default(), Repos: []string{"owner/repo"}})
 	m.width, m.height, m.viewer = 100, 12, "me"
+	m.filter = triage.FilterAll
 	m.sections[0].field.Succeed(m.sections[0].field.Generation, prs, domain.Provenance{Version: "list-v1", FreshUntil: now.Add(time.Hour)})
 	m.selected, m.hasSelection = prs[12].ID, true
 	m.opts.Enricher = testutil.Enricher{}
@@ -289,7 +293,7 @@ func TestReviewFilterIncludesIncompleteRowsAsPending(t *testing.T) {
 		t.Fatalf("review filter rows = %+v", sections.Review)
 	}
 	view := m.View()
-	if !strings.Contains(view, "REVIEW REQUESTED FROM ME") || !strings.Contains(view, "1 pending") {
+	if !strings.Contains(view, "Review req") || !strings.Contains(view, "1 pending") {
 		t.Fatalf("filter or pending state missing: %s", view)
 	}
 }
@@ -428,6 +432,79 @@ func TestReminderLoadWarningSurvivesListSuccess(t *testing.T) {
 	m = next.(Model)
 	if !strings.Contains(m.View(), "backup retained") {
 		t.Fatalf("reminder warning disappeared after list load: %s", m.View())
+	}
+}
+
+func TestDisplayModeDefaultsPersistsAndRestores(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "preferences.json")
+	store := preferences.NewFileStore(path)
+	m := New(Options{Config: config.Default(), DisplayPreferences: store})
+	if !m.emojiMode {
+		t.Fatal("display mode did not default to emoji")
+	}
+
+	next, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'e'}})
+	m = next.(Model)
+	if m.emojiMode || m.tableModeHint() != "e emoji" {
+		t.Fatalf("after first toggle mode=%t hint=%q, want text mode", m.emojiMode, m.tableModeHint())
+	}
+	reloaded := New(Options{Config: config.Default(), DisplayPreferences: preferences.NewFileStore(path)})
+	if reloaded.emojiMode {
+		t.Fatal("text mode was not restored after reload")
+	}
+
+	next, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'e'}})
+	m = next.(Model)
+	reloaded = New(Options{Config: config.Default(), DisplayPreferences: preferences.NewFileStore(path)})
+	if !m.emojiMode || !reloaded.emojiMode {
+		t.Fatal("emoji mode was not persisted and restored after the second toggle")
+	}
+}
+
+func TestDisplayModeSaveFailureKeepsCurrentModeAndReportsError(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "preferences.json")
+	if err := os.Mkdir(path, 0700); err != nil {
+		t.Fatal(err)
+	}
+	store := preferences.NewFileStore(path)
+	m := New(Options{Config: config.Default(), DisplayPreferences: store})
+	if !m.emojiMode || m.status == "" {
+		t.Fatalf("invalid preference file did not default and report: mode=%t status=%q", m.emojiMode, m.status)
+	}
+	next, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'e'}})
+	m = next.(Model)
+	if m.emojiMode || !strings.Contains(m.status, "Display preference save failed") {
+		t.Fatalf("save failure changed behavior unexpectedly: mode=%t status=%q", m.emojiMode, m.status)
+	}
+}
+
+func TestEmojiLoadingIndicatorAnimatesForBackgroundRows(t *testing.T) {
+	now := time.Now()
+	first, second := testUIPr(1, now), testUIPr(2, now.Add(-time.Minute))
+	m := loadedModel(t, []domain.PR{first, second})
+	rows := m.allRows()
+	if len(rows) != 2 {
+		t.Fatalf("loaded rows = %d, want 2", len(rows))
+	}
+	selected := rows[0].ID
+	background := rows[1]
+	m.selected, m.hasSelection = selected, true
+	key := domain.FieldKey{Item: background.ID, Name: "checks", Revision: background.HeadSHA}
+	f := domain.NewField[any]()
+	generation := f.Queue()
+	f.Begin(generation)
+	m.fields[key] = &f
+	if !m.active() {
+		t.Fatal("background table loading did not keep the spinner ticking")
+	}
+	cell := m.tableCellFor(triage.Row{PR: background}, columnChecks)
+	before := cell.render(m.tableDisplayMode())
+	next, _ := m.Update(tickMsg(now))
+	m = next.(Model)
+	cell = m.tableCellFor(triage.Row{PR: background}, columnChecks)
+	after := cell.render(m.tableDisplayMode())
+	if before != frames[0] || after != frames[1] || before == after {
+		t.Fatalf("background loading indicator = %q then %q, want animated frames %q and %q", before, after, frames[0], frames[1])
 	}
 }
 

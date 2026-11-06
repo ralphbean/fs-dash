@@ -104,3 +104,57 @@ func TestDefaultPathRejectsRelativeXDGStateHome(t *testing.T) {
 		t.Fatal("relative XDG_STATE_HOME should be rejected")
 	}
 }
+
+func TestDefaultPathUsesTriageFileName(t *testing.T) {
+	stateHome := t.TempDir()
+	t.Setenv("XDG_STATE_HOME", stateHome)
+	got, err := DefaultPath()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := filepath.Join(stateHome, "fs-dash", "triage.json")
+	if got != want {
+		t.Fatalf("DefaultPath() = %q, want %q", got, want)
+	}
+}
+
+func TestLoadMigratesLegacyReminderStateToTriageFile(t *testing.T) {
+	dir := t.TempDir()
+	legacyPath := filepath.Join(dir, "reminders.json")
+	triagePath := filepath.Join(dir, "triage.json")
+	id := domain.ItemID{Source: "github", Host: "github.com", Repo: "owner/repo", Number: 7}
+	legacy := NewFileStore(legacyPath)
+	if err := legacy.Load(); err != nil {
+		t.Fatal(err)
+	}
+	if err := legacy.ToggleStar(id); err != nil {
+		t.Fatal(err)
+	}
+	wake := time.Date(2026, 11, 6, 12, 0, 0, 0, time.UTC)
+	if err := legacy.Snooze(id, wake); err != nil {
+		t.Fatal(err)
+	}
+	legacyBytes, err := os.ReadFile(legacyPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	migrated := NewFileStore(triagePath)
+	if err := migrated.Load(); err != nil {
+		t.Fatal(err)
+	}
+	entry := migrated.Snapshot()[id]
+	if !entry.Starred || !entry.SnoozedUntil.Equal(wake) {
+		t.Fatalf("migrated triage entry = %+v, want star and snooze", entry)
+	}
+	if _, err := os.Stat(triagePath); err != nil {
+		t.Fatalf("new triage file was not written: %v", err)
+	}
+	legacyAfter, err := os.ReadFile(legacyPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(legacyAfter) != string(legacyBytes) {
+		t.Fatal("legacy reminder file changed during migration")
+	}
+}

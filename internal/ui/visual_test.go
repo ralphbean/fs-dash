@@ -98,6 +98,7 @@ func TestNoColorKeepsStatusLabelsAndFocusMarker(t *testing.T) {
 	m = next.(Model)
 	m.sections[0].field.Succeed(m.sections[0].field.Generation, []domain.PR{{ID: id, Title: "A selected pull request", HeadSHA: "head", URL: "https://github.com/owner/repo/pull/7"}}, domain.Provenance{FreshUntil: time.Now().Add(time.Hour)})
 	m.ensureSelection()
+	m.emojiMode = false
 	key := domain.FieldKey{Item: id, Name: "reviews", Revision: "head"}
 	f := domain.NewField[any]()
 	generation := f.Queue()
