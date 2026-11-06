@@ -18,6 +18,10 @@ const maxConcurrentFieldFetches = 2
 
 var tableSummaryFieldNames = []string{"last_touched", "checks", "reviews", "review_threads", "assignees"}
 
+func (m Model) showingSnoozed() bool {
+	return m.filter == triage.FilterSnoozed
+}
+
 func (m Model) fieldFor(pr domain.PR, name string) *domain.Field[any] {
 	return m.fields[domain.FieldKey{Item: pr.ID, Name: name, Revision: pr.HeadSHA}]
 }
@@ -55,7 +59,7 @@ func (m Model) projection() triage.Sections {
 		pr := domain.PR{ID: id, Title: "No longer open in the current list", URL: fmt.Sprintf("https://%s/%s/pull/%d", host, id.Repo, id.Number)}
 		inputs = append(inputs, m.triageInput(pr, entry))
 	}
-	return triage.Project(inputs, m.filter, m.showSnoozed, now)
+	return triage.Project(inputs, m.filter, now)
 }
 
 func (m Model) triageInput(pr domain.PR, saved reminder.Entry) triage.Input {
@@ -259,7 +263,7 @@ func (m Model) visibleRowsForPrefetch() []domain.PR {
 	var positioned []rowPosition
 	selectedLine := -1
 	contentLine := 0
-	if m.showSnoozed {
+	if m.showingSnoozed() {
 		contentLine = 2 // Snoozed heading and table header.
 		for _, row := range sections.Snoozed {
 			if row.PR.ID == m.selected {
@@ -299,7 +303,7 @@ func (m Model) visibleRowsForPrefetch() []domain.PR {
 	selected, hasSelected := m.selectedPR()
 	if hasSelected {
 		var selectedRow triage.Row
-		if m.showSnoozed {
+		if m.showingSnoozed() {
 			for _, row := range sections.Snoozed {
 				if row.PR.ID == selected.ID {
 					selectedRow = row
@@ -549,27 +553,27 @@ func (m Model) listView() string {
 		scope = strings.Join(m.opts.Repos, ", ")
 	}
 	lines := m.visual.header("fs-dash · Pull requests", scope, m.width)
-	if m.showSnoozed {
-		lines = append(lines, m.visual.paint(roleAccent, m.visual.fit("Snoozed PRs · S view · u unsnooze", m.width)))
+	if m.showingSnoozed() {
+		lines = append(lines, m.visual.paint(roleAccent, m.visual.fit("Snoozed PRs · f cycle · u unsnooze", m.width)))
 	} else {
-		filterLabel := "Filter: " + m.filter.Label() + " · f cycle · ★ star · z snooze · S snoozed"
+		filterLabel := "Filter: " + m.filter.Label() + " · f cycle · s star · z snooze"
 		if m.width < 52 {
-			filterLabel = "Filter: " + m.filter.Label() + " · f · s · z · S"
+			filterLabel = "Filter: " + m.filter.Label() + " · f · s · z"
 		}
 		lines = append(lines, m.visual.paint(roleAccent, m.visual.fit(filterLabel, m.width)))
 	}
 	tableRows := make([]triage.Row, 0, len(sections.Review)+len(sections.Active)+len(sections.Snoozed))
-	if m.showSnoozed {
+	if m.showingSnoozed() {
 		tableRows = append(tableRows, sections.Snoozed...)
 	} else {
 		tableRows = append(tableRows, sections.Review...)
 		tableRows = append(tableRows, sections.Active...)
 	}
-	columns, widths := m.tableColumns(tableRows, m.showSnoozed)
+	columns, widths := m.tableColumns(tableRows, m.showingSnoozed())
 	content := make([]string, 0, len(tableRows)+len(m.sections)+8)
 	rows := make(map[domain.ItemID]triage.Row)
 	selectedLine := -1
-	if m.showSnoozed {
+	if m.showingSnoozed() {
 		content = append(content, m.visual.paint(roleAccent, "SNOOZED"))
 		content = append(content, m.renderTableHeader(columns, widths))
 		for _, row := range sections.Snoozed {
@@ -605,10 +609,10 @@ func (m Model) listView() string {
 		}
 	}
 	if len(rows) == 0 {
-		if m.showSnoozed {
+		if m.showingSnoozed() {
 			content = append(content, m.visual.paint(roleMuted, "No PRs are currently snoozed."))
 		} else {
-			content = append(content, m.visual.paint(roleMuted, "No matching PRs. Unrequested or incomplete filter data remains visible as pending."))
+			content = append(content, m.visual.paint(roleMuted, "No PRs match this filter. Pending filter data remains visible when its result is unknown."))
 		}
 	}
 	if len(m.opts.Repos) == 0 {
@@ -645,9 +649,9 @@ func (m Model) listView() string {
 	if m.status != "" {
 		lines = append(lines, m.visual.paint(roleWarning, m.visual.fit(m.status, m.width)))
 	}
-	footer := "j/k move · enter details · f filter · s star · z snooze · S snoozed · r refresh · L logs · ? help · q quit"
-	if m.showSnoozed {
-		footer = "j/k move · u unsnooze · S return · L logs · ? help · q quit"
+	footer := "j/k move · enter details · f filters · s star · z snooze · r refresh · L logs · ? help · q quit"
+	if m.showingSnoozed() {
+		footer = "j/k move · f filters · u unsnooze · L logs · ? help · q quit"
 	}
 	lines = append(lines, m.visual.footer(footer, m.width))
 	return strings.Join(lines, "\n") + "\n"
@@ -702,7 +706,7 @@ func (m Model) rowStatus(row triage.Row) string {
 	if row.FilterPending {
 		parts = append(parts, "filter pending")
 	}
-	if !m.showSnoozed {
+	if !m.showingSnoozed() {
 		for _, name := range triageFieldNames {
 			if name == "activity" {
 				continue

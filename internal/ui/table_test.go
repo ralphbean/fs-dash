@@ -106,7 +106,7 @@ func TestSnoozedTableAddsWakeColumn(t *testing.T) {
 		t.Fatal(err)
 	}
 	m := New(Options{Config: config.Default(), Repos: []string{"owner/repo"}, Clock: &testClock{now: now}, Reminders: store})
-	m.width, m.height, m.viewer, m.showSnoozed = 180, 30, "me", true
+	m.width, m.height, m.viewer, m.filter = 180, 30, "me", triage.FilterSnoozed
 	m.sections[0].field.Succeed(m.sections[0].field.Generation, []domain.PR{pr}, domain.Provenance{Version: "list-v1", FreshUntil: now.Add(time.Hour)})
 	m.ensureSelection()
 	view := ansi.Strip(m.View())

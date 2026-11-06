@@ -15,7 +15,7 @@ func TestReviewRequestedFilterKeepsUnknownRowsPending(t *testing.T) {
 		{PR: testPR(2, now), ReviewRequest: domain.DerivedBool{Known: true, Value: false}},
 		{PR: testPR(3, now)},
 	}
-	got := Project(inputs, FilterReviewRequested, false, now)
+	got := Project(inputs, FilterReviewRequested, now)
 	if len(got.Review) != 2 || got.Review[0].PR.ID.Number != 1 || got.Review[1].PR.ID.Number != 3 || !got.Review[1].FilterPending {
 		t.Fatalf("review requested projection = %+v", got.Review)
 	}
@@ -28,7 +28,7 @@ func TestAssignedFilterKeepsIncompleteRowsPending(t *testing.T) {
 		{PR: testPR(2, now), Assigned: domain.DerivedBool{Known: true, Value: false}},
 		{PR: testPR(3, now)},
 	}
-	got := Project(inputs, FilterAssigned, false, now).Review
+	got := Project(inputs, FilterAssigned, now).Review
 	if len(got) != 2 || got[0].PR.ID.Number != 1 || got[1].PR.ID.Number != 3 || !got[1].FilterPending {
 		t.Fatalf("assigned filter projection = %+v", got)
 	}
@@ -46,7 +46,7 @@ func TestRankingReasonsPriorityAndNumericStableTies(t *testing.T) {
 		{PR: testPR(7, now), BotApproval: domain.DerivedBool{Known: true, Value: true}},
 		{PR: testPR(8, now), BotApproval: domain.DerivedBool{}},
 	}
-	got := Project(inputs, FilterAll, false, now).Review
+	got := Project(inputs, FilterAll, now).Review
 	want := []int{3, 4, 5, 6, 2, 8, 10, 7}
 	var numbers []int
 	for _, row := range got {
@@ -69,15 +69,15 @@ func TestActivityAndSnoozeSectionsAndWake(t *testing.T) {
 		{PR: testPR(1, now), Activity: domain.ActivityEvidence{State: domain.ActivityActive}},
 		{PR: testPR(2, now), SnoozedUntil: now.Add(time.Hour)},
 	}
-	visible := Project(inputs, FilterAll, false, now)
+	visible := Project(inputs, FilterAll, now)
 	if len(visible.Review) != 0 || len(visible.Active) != 1 || len(visible.Snoozed) != 0 {
 		t.Fatalf("normal sections = %+v", visible)
 	}
-	hidden := Project(inputs, FilterAll, true, now)
+	hidden := Project(inputs, FilterSnoozed, now)
 	if len(hidden.Snoozed) != 1 || hidden.Snoozed[0].PR.ID.Number != 2 {
 		t.Fatalf("snoozed view = %+v", hidden.Snoozed)
 	}
-	woken := Project(inputs, FilterAll, false, now.Add(2*time.Hour))
+	woken := Project(inputs, FilterAll, now.Add(2*time.Hour))
 	if len(woken.Review) != 1 || woken.Review[0].PR.ID.Number != 2 {
 		t.Fatalf("expired snooze did not reappear: %+v", woken)
 	}

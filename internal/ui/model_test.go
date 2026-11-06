@@ -350,8 +350,10 @@ func TestStarSnoozeHiddenViewAndManualUnsnooze(t *testing.T) {
 	if len(m.allRows()) != 0 {
 		t.Fatal("snoozed PR remained in the normal view")
 	}
-	next, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'S'}})
-	m = next.(Model)
+	for range 4 {
+		next, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'f'}})
+		m = next.(Model)
+	}
 	if !strings.Contains(m.View(), "SNOOZED") || !strings.Contains(m.View(), "★ starred") {
 		t.Fatalf("hidden snoozed item is not inspectable: %s", m.View())
 	}
@@ -360,7 +362,7 @@ func TestStarSnoozeHiddenViewAndManualUnsnooze(t *testing.T) {
 	if !m.opts.Reminders.Snapshot()[pr.ID].SnoozedUntil.IsZero() {
 		t.Fatal("manual unsnooze did not clear wake time")
 	}
-	next, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'S'}})
+	next, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'f'}})
 	m = next.(Model)
 	if len(m.allRows()) != 1 || m.allRows()[0].ID != pr.ID {
 		t.Fatal("unsnoozed PR did not return to normal view")

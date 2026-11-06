@@ -15,16 +15,24 @@ const (
 	FilterAssigned        Filter = "assigned-to-me"
 	FilterReviewRequested Filter = "review-requested-from-me"
 	FilterAuthored        Filter = "authored-by-me"
+	FilterStarred         Filter = "starred"
+	FilterSnoozed         Filter = "snoozed"
 )
 
 func (f Filter) Next() Filter {
 	switch f {
 	case FilterAll:
-		return FilterAssigned
+		return FilterAuthored
 	case FilterAssigned:
 		return FilterReviewRequested
 	case FilterReviewRequested:
-		return FilterAuthored
+		return FilterStarred
+	case FilterAuthored:
+		return FilterAssigned
+	case FilterStarred:
+		return FilterSnoozed
+	case FilterSnoozed:
+		return FilterAll
 	default:
 		return FilterAll
 	}
@@ -38,6 +46,10 @@ func (f Filter) Label() string {
 		return "review requested from me"
 	case FilterAuthored:
 		return "authored by me"
+	case FilterStarred:
+		return "starred"
+	case FilterSnoozed:
+		return "snoozed"
 	default:
 		return "all open PRs"
 	}
@@ -79,11 +91,11 @@ type Sections struct {
 
 const staleAfter = 7 * 24 * time.Hour
 
-func Project(inputs []Input, filter Filter, showSnoozed bool, now time.Time) Sections {
+func Project(inputs []Input, filter Filter, now time.Time) Sections {
 	var out Sections
 	for _, in := range inputs {
 		snoozed := in.SnoozedUntil.After(now)
-		if showSnoozed {
+		if filter == FilterSnoozed {
 			if snoozed {
 				out.Snoozed = append(out.Snoozed, makeRow(in, now, false))
 			}
@@ -131,6 +143,8 @@ func matchesFilter(in Input, filter Filter) (bool, bool) {
 			return true, true
 		}
 		return in.AuthoredByMe.Value, false
+	case FilterStarred:
+		return in.Starred, false
 	default:
 		return true, false
 	}

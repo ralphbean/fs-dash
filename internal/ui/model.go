@@ -57,7 +57,6 @@ type Model struct {
 	fieldQueued                     map[domain.FieldKey]bool
 	fieldInFlight                   map[domain.FieldKey]uint64
 	filter                          triage.Filter
-	showSnoozed                     bool
 	viewer                          string
 	wakeTickRunning                 bool
 	wakeGeneration                  uint64
@@ -128,7 +127,7 @@ func New(opts Options) Model {
 	if opts.Reminders == nil {
 		opts.Reminders = reminder.NewMemoryStore()
 	}
-	m := Model{opts: opts, mode: "list", logLevel: "all", width: 100, height: 30, fields: map[domain.FieldKey]*domain.Field[any]{}, fieldAttempts: map[domain.FieldKey]int{}, fieldQueued: map[domain.FieldKey]bool{}, fieldInFlight: map[domain.FieldKey]uint64{}, activityQueued: map[domain.FieldKey]bool{}, activityInFlight: map[domain.FieldKey]uint64{}, filter: triage.FilterAssigned, visual: newVisualTheme(opts.Config)}
+	m := Model{opts: opts, mode: "list", logLevel: "all", width: 100, height: 30, fields: map[domain.FieldKey]*domain.Field[any]{}, fieldAttempts: map[domain.FieldKey]int{}, fieldQueued: map[domain.FieldKey]bool{}, fieldInFlight: map[domain.FieldKey]uint64{}, activityQueued: map[domain.FieldKey]bool{}, activityInFlight: map[domain.FieldKey]uint64{}, filter: triage.FilterAuthored, visual: newVisualTheme(opts.Config)}
 	m.visual.compact = m.width < 64
 	if opts.ReminderLoadError != nil {
 		m.reminderWarning = "Local reminders: " + opts.ReminderLoadError.Error()
@@ -280,7 +279,6 @@ func (m *Model) applySnooze(duration time.Duration) {
 		m.status = "PR snoozed until " + until.Local().Format("Jan 02 15:04")
 	}
 	m.mode = "list"
-	m.showSnoozed = false
 	m.ensureSelection()
 }
 func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
@@ -510,16 +508,13 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			m.filter = m.filter.Next()
 			m.ensureSelection()
 			cmds = append(cmds, m.selectedFields(false)...)
-		case "S":
-			m.showSnoozed = !m.showSnoozed
-			m.ensureSelection()
-			cmds = append(cmds, m.selectedFields(false)...)
 		case "s":
 			if m.hasSelection {
 				if err := m.opts.Reminders.ToggleStar(m.selected); err != nil {
 					m.status = "Star update failed: " + err.Error()
 				} else {
 					m.status = "Star updated locally"
+					m.ensureSelection()
 				}
 			}
 		case "z":
@@ -632,7 +627,7 @@ func (m Model) helpView() string {
 		keys = append(keys, key)
 	}
 	sort.Strings(keys)
-	content := []string{"j/k or arrows  move selection", "enter          PR details", "esc            back", "f              cycle all/assigned/review-requested", "s              toggle local star", "z              choose snooze duration", "S              show or hide snoozed PRs", "u              unsnooze selected PR", "r              refresh all sections", "L              log console", "?              toggle help", "q              quit"}
+	content := []string{"j/k or arrows  move selection", "enter          PR details", "esc            back", "f              cycle all/authored/assigned/review-requested/starred/snoozed", "s              toggle local star", "z              choose snooze duration", "u              unsnooze selected PR", "r              refresh all sections", "L              log console", "?              toggle help", "q              quit"}
 	for _, key := range keys {
 		content = append(content, fmt.Sprintf("%s              %s", key, m.opts.Config.Bindings[key].Executable))
 	}
