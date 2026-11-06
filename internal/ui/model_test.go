@@ -10,6 +10,7 @@ import (
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/x/ansi"
 	"github.com/fullsend-ai/fs-dash/internal/config"
 	"github.com/fullsend-ai/fs-dash/internal/diag"
 	"github.com/fullsend-ai/fs-dash/internal/domain"
@@ -80,6 +81,55 @@ func TestListViewUsesTerminalHeight(t *testing.T) {
 	m = next.(Model)
 	if lines := strings.Count(m.View(), "\n"); lines > 24 {
 		t.Fatalf("view exceeds terminal height: %d lines", lines)
+	}
+}
+
+func TestRepositorySummariesShareOneHorizontalRow(t *testing.T) {
+	now := time.Now()
+	repos := []string{"alpha/one", "bravo/two", "charlie/three"}
+	m := New(Options{Config: config.Default(), Repos: repos})
+	m.width, m.height, m.viewer = 260, 32, "me"
+	for i, repo := range repos {
+		pr := testUIPr(i+1, now)
+		pr.ID.Repo = repo
+		pr.URL = fmt.Sprintf("https://github.com/%s/pull/%d", repo, i+1)
+		pr.Assignees = domain.AssigneeSet{Logins: []string{"me"}, Complete: true}
+		m.sections[i].field.Succeed(m.sections[i].field.Generation, []domain.PR{pr}, domain.Provenance{Version: "list-v1", FreshUntil: now.Add(time.Hour)})
+	}
+	m.ensureSelection()
+
+	assertSummaryRow := func(width int) (string, []string) {
+		t.Helper()
+		m.width = width
+		m.visual.compact = width < 64
+		view := m.View()
+		lines := strings.Split(strings.TrimSuffix(ansi.Strip(view), "\n"), "\n")
+		reviewLine, tableHeaderLine := -1, -1
+		for i, line := range lines {
+			if strings.Contains(line, "REVIEW ·") {
+				reviewLine = i
+			}
+			if strings.Contains(line, "PR") && strings.Contains(line, "Title") {
+				tableHeaderLine = i
+			}
+		}
+		if reviewLine < 0 || tableHeaderLine != reviewLine+2 {
+			t.Fatalf("repository summaries did not occupy exactly one row above the table at width %d: %s", width, view)
+		}
+		return lines[reviewLine+1], strings.Split(strings.TrimSuffix(view, "\n"), "\n")
+	}
+
+	wideSummary, _ := assertSummaryRow(260)
+	for _, repo := range repos {
+		if !strings.Contains(wideSummary, repo+" ·") {
+			t.Errorf("horizontal summary row omitted %q: %s", repo, wideSummary)
+		}
+	}
+	_, narrowLines := assertSummaryRow(80)
+	for i, line := range narrowLines {
+		if width := ansi.StringWidth(line); width > 80 {
+			t.Errorf("narrow view line %d is %d cells wide: %q", i+1, width, line)
+		}
 	}
 }
 

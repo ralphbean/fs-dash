@@ -581,9 +581,8 @@ func (m Model) listView() string {
 		}
 	} else {
 		content = append(content, m.visual.paint(roleAccent, "REVIEW · "+strings.ToUpper(m.filter.Label())))
-		for _, section := range m.sections {
-			state, role := m.sectionStatus(section)
-			content = append(content, m.visual.paint(roleMuted, section.repo+" · ")+m.visual.paint(role, state))
+		if summaries := m.repositorySummaryLine(); summaries != "" {
+			content = append(content, summaries)
 		}
 		content = append(content, m.renderTableHeader(columns, widths))
 		for _, row := range sections.Review {
@@ -668,6 +667,16 @@ func (m Model) View() string {
 		return m.snoozeView()
 	}
 	return m.listView()
+}
+
+func (m Model) repositorySummaryLine() string {
+	var parts []string
+	for _, section := range m.sections {
+		state, role := m.sectionStatus(section)
+		parts = append(parts, m.visual.paint(roleMuted, section.repo+" · ")+m.visual.paint(role, state))
+	}
+	separator := m.visual.paint(roleMuted, "  │  ")
+	return strings.Join(parts, separator)
 }
 
 func (m Model) renderRow(row triage.Row) string {

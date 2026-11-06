@@ -32,7 +32,7 @@ The system SHALL use borders or dividers to distinguish the app header, PR secti
 - **THEN** a clearly framed log view replaces the list and closing it restores the prior selection
 
 ### Requirement: Layout fits the terminal
-The system SHALL account for border and padding width when truncating text and limiting rows. At common terminal sizes, including 80 columns by 24 rows, the active view SHALL fit without unintended line wraps or content lost below the terminal.
+The system SHALL account for border and padding width when truncating text and limiting rows. At common terminal sizes, including 80 columns by 24 rows, the active view SHALL fit without unintended line wraps or content lost below the terminal. Repository status summaries SHALL share one horizontal row above the PR table, regardless of the number of configured repositories.
 
 #### Scenario: Resize a populated list
 - **WHEN** the terminal shrinks while a PR is selected
@@ -41,6 +41,14 @@ The system SHALL account for border and padding width when truncating text and l
 #### Scenario: Very narrow terminal
 - **WHEN** there is insufficient room for a full framed layout
 - **THEN** the UI uses a compact readable layout and keeps navigation and status accessible
+
+#### Scenario: Multiple repository summaries use one row
+- **WHEN** the PR list has status summaries for multiple configured repositories
+- **THEN** the summaries appear left-to-right together on one row above the PR table
+
+#### Scenario: Horizontal summaries exceed frame width
+- **WHEN** the combined repository summary row exceeds the frame's inner width
+- **THEN** it remains on one line and is truncated within the frame
 
 ### Requirement: Color is optional and never sole meaning
 The system SHALL provide dark and light palettes, an automatic color-capability mode, and a no-color option. It SHALL honor `NO_COLOR`; status and focus SHALL remain understandable through words, symbols, and borders when color is disabled.
