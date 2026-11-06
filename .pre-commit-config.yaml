@@ -1,0 +1,9 @@
+repos:
+  - repo: local
+    hooks:
+      - id: conventional-commit
+        name: Check Conventional Commit message
+        entry: scripts/check-conventional-commit.sh
+        language: script
+        stages: [commit-msg]
+        always_run: true
