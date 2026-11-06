@@ -20,6 +20,7 @@ See proposal.md - Why. The GitHub adapter uses `gh api` for paginated PR lists a
 - Parse transport metadata separately from the JSON response body so existing GraphQL decoders continue to consume JSON. For paginated operations, retain the most conservative remaining amount from the response pages and its associated reset time; record when that observation was received.
 - Pass an optional quota observation alongside list and field completion messages into one model-level snapshot. Ignore malformed or missing metadata rather than replacing a valid observation with fabricated values.
 - Show a compact indicator in the shared dashboard status area. Use a warning state below 20% remaining and an exhausted state at zero; include the reset time and observation age so users can judge freshness.
+- Treat observations older than five minutes as stale while retaining their values and reset time.
 - Leave the indicator unknown until a response provides metadata. Keep the last valid observation visible when later requests fail without quota headers.
 
 ## Risks / Trade-offs

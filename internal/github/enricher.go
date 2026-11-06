@@ -1,6 +1,7 @@
 package github
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -215,40 +216,54 @@ func (e Enricher) FetchField(ctx context.Context, key domain.FieldKey) (any, dom
 	if cli == "" {
 		cli = "gh"
 	}
-	cmd := exec.CommandContext(ctx, cli, "api", "graphql", "-f", "query="+query,
+	cmd := exec.CommandContext(ctx, cli, "api", "graphql", "--include", "-f", "query="+query,
 		"-F", "owner="+owner, "-F", "name="+name, "-F", fmt.Sprintf("number=%d", key.Item.Number))
 	output, err := cmd.CombinedOutput()
+	observedAt := time.Now()
+	if e.Now != nil {
+		observedAt = e.Now()
+	}
+	headers, body, responseErr := parseIncludedResponse(output)
+	quota := parseQuotaObservation(headers, observedAt)
+	provenance := domain.Provenance{Source: "github", Quota: quota}
 	if err != nil {
-		return nil, domain.Provenance{}, classifyCLIError(err, string(output))
+		issue := classifyCLIError(err, string(output))
+		applyQuotaRetry(issue, quota)
+		return nil, provenance, issue
+	}
+	if responseErr != nil {
+		return nil, provenance, &domain.FetchError{Kind: domain.ErrorTransient, Message: "GitHub returned unreadable response metadata"}
 	}
 	var page graphPage
-	if err := json.Unmarshal(output, &page); err != nil {
-		return nil, domain.Provenance{}, &domain.FetchError{Kind: domain.ErrorTransient, Message: "GitHub returned unreadable triage data"}
+	if err := json.NewDecoder(bytes.NewReader(body)).Decode(&page); err != nil {
+		return nil, provenance, &domain.FetchError{Kind: domain.ErrorTransient, Message: "GitHub returned unreadable triage data"}
 	}
 	if len(page.Errors) > 0 {
-		return nil, domain.Provenance{}, classifyCLIError(fmt.Errorf("GraphQL error"), page.Errors[0].Message)
+		issue := classifyCLIError(fmt.Errorf("GraphQL error"), page.Errors[0].Message)
+		applyQuotaRetry(issue, quota)
+		return nil, provenance, issue
 	}
 	if page.Data.Repository == nil || page.Data.Repository.PullRequest == nil {
-		return nil, domain.Provenance{}, &domain.FetchError{Kind: domain.ErrorPermission, Message: "GitHub pull request unavailable or access denied"}
+		return nil, provenance, &domain.FetchError{Kind: domain.ErrorPermission, Message: "GitHub pull request unavailable or access denied"}
 	}
 	pr := page.Data.Repository.PullRequest
-	now := time.Now()
-	if e.Now != nil {
-		now = e.Now()
-	}
+	now := observedAt
 	var value any
 	if key.Name == "last_touched" {
 		if pr.TimelineItems.UpdatedAt.IsZero() {
-			return nil, domain.Provenance{}, &domain.FetchError{Kind: domain.ErrorTransient, Message: "GitHub timeline timestamp unavailable"}
+			return nil, provenance, &domain.FetchError{Kind: domain.ErrorTransient, Message: "GitHub timeline timestamp unavailable"}
 		}
 		value = domain.TimelineActivity{UpdatedAt: pr.TimelineItems.UpdatedAt}
 	} else {
 		value, err = fieldValue(key.Name, page.Data.Viewer.Login, pr, now)
 		if err != nil {
-			return nil, domain.Provenance{}, err
+			return nil, provenance, err
 		}
 	}
-	return value, domain.Provenance{Source: "github", FetchedAt: now, Version: now.Format(time.RFC3339Nano), FreshUntil: now.Add(fieldFreshFor)}, nil
+	provenance.FetchedAt = now
+	provenance.Version = now.Format(time.RFC3339Nano)
+	provenance.FreshUntil = now.Add(fieldFreshFor)
+	return value, provenance, nil
 }
 
 var fieldQueries = map[string]string{

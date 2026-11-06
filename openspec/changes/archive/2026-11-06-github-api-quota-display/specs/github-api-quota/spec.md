@@ -24,5 +24,5 @@ The application SHALL capture GitHub's primary API quota limit, remaining amount
 - **THEN** the indicator identifies the quota as exhausted and shows the reset time
 
 #### Scenario: Quota information is unavailable or old
-- **WHEN** the application has no quota observation or its last observation is no longer recent
+- **WHEN** the application has no quota observation or its last observation is more than five minutes old
 - **THEN** the dashboard shows an unknown or stale status with the last observation time and does not present missing data as current quota

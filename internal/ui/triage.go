@@ -681,8 +681,9 @@ func (m Model) listView() string {
 		context = m.selectedContext(selected, rows[selected.ID])
 	}
 	statusLines := 0
+	statusLines++ // quota status is always present, including the unknown state
 	if m.status != "" {
-		statusLines = 1
+		statusLines++
 	}
 	if m.reminderWarning != "" {
 		statusLines++
@@ -703,6 +704,7 @@ func (m Model) listView() string {
 	if m.reminderWarning != "" {
 		lines = append(lines, m.visual.paint(roleWarning, m.visual.fit(m.reminderWarning, m.width)))
 	}
+	lines = append(lines, m.quotaStatusLine())
 	if m.status != "" {
 		lines = append(lines, m.visual.paint(roleWarning, m.visual.fit(m.status, m.width)))
 	}
@@ -738,6 +740,101 @@ func (m Model) repositorySummaryLine() string {
 	}
 	separator := m.visual.paint(roleMuted, "  │  ")
 	return strings.Join(parts, separator)
+}
+
+func (m Model) quotaStatusLine() string {
+	if m.quota == nil {
+		label := "GitHub API quota: unknown"
+		if m.visual.compact || m.width < 64 {
+			label = "API quota: unknown"
+		}
+		return m.visual.paint(roleMuted, m.visual.fit(label, m.width))
+	}
+	observation := m.quota
+	now := m.opts.Clock.Now()
+	age := now.Sub(observation.ObservedAt)
+	if age < 0 {
+		age = 0
+	}
+	state := ""
+	role := roleNeutral
+	if age >= quotaStaleAfter {
+		state = "stale"
+		role = roleMuted
+	}
+	if observation.Remaining == 0 {
+		if state != "" {
+			state += " · "
+		}
+		state += "exhausted"
+		role = roleWarning
+	} else if int64(observation.Remaining)*5 < int64(observation.Limit) {
+		if state != "" {
+			state += " · "
+		}
+		state += "low"
+		role = roleWarning
+	}
+	resource := "API"
+	if strings.EqualFold(observation.Resource, "graphql") {
+		resource = "GraphQL"
+	} else if observation.Resource != "" {
+		resource = strings.ToUpper(observation.Resource[:1]) + observation.Resource[1:]
+	}
+	ageText := "now"
+	if age >= time.Minute {
+		if age >= time.Hour {
+			ageText = fmt.Sprintf("%dh", int(age/time.Hour))
+		} else {
+			ageText = fmt.Sprintf("%dm", int(age/time.Minute))
+		}
+	}
+	resetText := quotaResetText(observation.ResetAt, now, false)
+	stateText := "current"
+	if state != "" {
+		stateText = state
+	}
+	label := fmt.Sprintf("%s quota: %s · %d/%d left · %d used · %s · %s", resource, stateText, observation.Remaining, observation.Limit, observation.Used, resetText, ageText)
+	if m.visual.compact || m.width < 64 {
+		compactResource := resource
+		if resource == "GraphQL" {
+			compactResource = "GQL"
+		}
+		compactState := strings.ToUpper(stateText)
+		resetText = quotaResetText(observation.ResetAt, now, true)
+		label = fmt.Sprintf("%s %s · %d/%d left · %d used · %s · %s", compactResource, compactState, observation.Remaining, observation.Limit, observation.Used, resetText, ageText)
+	}
+	return m.visual.paint(role, m.visual.fit(label, m.width))
+}
+
+func quotaResetText(resetAt, now time.Time, compact bool) string {
+	if resetAt.IsZero() {
+		return "reset time unknown"
+	}
+	remaining := resetAt.Sub(now)
+	if remaining <= 0 {
+		return "reset now"
+	}
+	var unit time.Duration
+	var fullUnit, shortUnit string
+	switch {
+	case remaining < time.Minute:
+		unit, fullUnit, shortUnit = time.Second, "second", "s"
+	case remaining < time.Hour:
+		unit, fullUnit, shortUnit = time.Minute, "minute", "m"
+	case remaining < 24*time.Hour:
+		unit, fullUnit, shortUnit = time.Hour, "hour", "h"
+	default:
+		unit, fullUnit, shortUnit = 24*time.Hour, "day", "d"
+	}
+	count := int((remaining + unit - 1) / unit)
+	if compact {
+		return fmt.Sprintf("reset in %d%s", count, shortUnit)
+	}
+	if count != 1 {
+		fullUnit += "s"
+	}
+	return fmt.Sprintf("reset in %d %s", count, fullUnit)
 }
 
 func (m Model) renderRow(row triage.Row) string {

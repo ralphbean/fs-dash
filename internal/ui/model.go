@@ -62,6 +62,8 @@ type Model struct {
 	filter                          triage.Filter
 	emojiMode                       bool
 	viewer                          string
+	quota                           *domain.QuotaObservation
+	quotaGeneration                 uint64
 	wakeTickRunning                 bool
 	wakeGeneration                  uint64
 	nextWake                        time.Time
@@ -75,6 +77,7 @@ type listMsg struct {
 	generation uint64
 	value      []domain.PR
 	viewer     string
+	quota      *domain.QuotaObservation
 	err        error
 	at         time.Time
 	attempt    int
@@ -99,12 +102,15 @@ type retryMsg struct {
 }
 type tickMsg time.Time
 type wakeMsg struct{ generation uint64 }
+type quotaTickMsg struct{ generation uint64 }
 type commandMsg struct {
 	key string
 	err error
 }
 
 var frames = []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
+
+const quotaStaleAfter = 5 * time.Minute
 
 func New(opts Options) Model {
 	if opts.Config.Version == 0 {
@@ -174,12 +180,13 @@ func (m Model) fetchList(repo string, generation uint64, attempt int) tea.Cmd {
 		value, err := m.opts.Scheduler.Do(context.Background(), "github", fmt.Sprintf("list:%s:%d", repo, generation), func(ctx context.Context) (any, error) { return m.opts.Lister.ListOpenPRs(ctx, repo) })
 		var prs []domain.PR
 		var viewer string
+		var quota *domain.QuotaObservation
 		if value != nil {
 			result := value.(domain.PRList)
-			prs, viewer = result.PullRequests, result.ViewerLogin
+			prs, viewer, quota = result.PullRequests, result.ViewerLogin, result.Quota
 		}
 		at := m.opts.Clock.Now()
-		return listMsg{repo: repo, generation: generation, value: prs, viewer: viewer, err: err, at: at, attempt: attempt, duration: at.Sub(start)}
+		return listMsg{repo: repo, generation: generation, value: prs, viewer: viewer, quota: quota, err: err, at: at, attempt: attempt, duration: at.Sub(start)}
 	}
 }
 func (m Model) fetchField(key domain.FieldKey, generation uint64, attempt int) tea.Cmd {
@@ -196,7 +203,14 @@ func (m Model) fetchField(key domain.FieldKey, generation uint64, attempt int) t
 			}{v, p}, e
 		})
 		if err != nil {
-			return fieldMsg{key: key, generation: generation, err: err, at: m.opts.Clock.Now(), attempt: attempt}
+			var provenance domain.Provenance
+			if value != nil {
+				provenance = value.(struct {
+					v any
+					p domain.Provenance
+				}).p
+			}
+			return fieldMsg{key: key, generation: generation, provenance: provenance, err: err, at: m.opts.Clock.Now(), attempt: attempt}
 		}
 		result := value.(struct {
 			v any
@@ -205,6 +219,61 @@ func (m Model) fetchField(key domain.FieldKey, generation uint64, attempt int) t
 		return fieldMsg{key: key, generation: generation, value: result.v, provenance: result.p, at: m.opts.Clock.Now(), attempt: attempt}
 	}
 }
+func (m *Model) observeQuota(observation *domain.QuotaObservation) bool {
+	if observation == nil || observation.Limit <= 0 || observation.Used < 0 || observation.Used > observation.Limit || observation.Remaining < 0 || observation.Remaining > observation.Limit || observation.ResetAt.IsZero() || observation.ObservedAt.IsZero() {
+		return false
+	}
+	if m.quota != nil {
+		sameResource := strings.EqualFold(observation.Resource, m.quota.Resource)
+		if sameResource {
+			if observation.ResetAt.Before(m.quota.ResetAt) {
+				return false
+			}
+			if observation.ResetAt.Equal(m.quota.ResetAt) {
+				if observation.Used < m.quota.Used || observation.Remaining > m.quota.Remaining {
+					return false
+				}
+				if observation.Used == m.quota.Used && observation.Remaining == m.quota.Remaining && observation.ObservedAt.Before(m.quota.ObservedAt) {
+					return false
+				}
+			}
+		} else if observation.ObservedAt.Before(m.quota.ObservedAt) {
+			return false
+		}
+	}
+	copy := *observation
+	m.quota = &copy
+	m.quotaGeneration++
+	return true
+}
+
+func (m Model) quotaRefreshCmd() tea.Cmd {
+	if m.quota == nil {
+		return nil
+	}
+	now := m.opts.Clock.Now()
+	age := now.Sub(m.quota.ObservedAt)
+	if age < 0 {
+		age = 0
+	}
+	untilReset := m.quota.ResetAt.Sub(now)
+	if untilReset <= 0 {
+		return nil
+	}
+	delay := time.Minute
+	if untilReset <= time.Minute {
+		delay = time.Second
+	}
+	if ageDelay := time.Minute - age%time.Minute; ageDelay < delay {
+		delay = ageDelay
+	}
+	if untilReset < delay {
+		delay = untilReset
+	}
+	generation := m.quotaGeneration
+	return tea.Tick(max(delay, time.Millisecond), func(time.Time) tea.Msg { return quotaTickMsg{generation: generation} })
+}
+
 func (m *Model) section(repo string) *section {
 	for i := range m.sections {
 		if m.sections[i].repo == repo {
@@ -309,7 +378,14 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			m.nextWake = time.Time{}
 			m.ensureSelection()
 		}
+	case quotaTickMsg:
+		if msg.generation == m.quotaGeneration {
+			cmds = append(cmds, m.quotaRefreshCmd())
+		}
 	case listMsg:
+		if m.observeQuota(msg.quota) {
+			cmds = append(cmds, m.quotaRefreshCmd())
+		}
 		s := m.section(msg.repo)
 		if s == nil || s.field.Generation != msg.generation {
 			break
@@ -351,6 +427,9 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			m.log("info", "retry-list", s.repo, s.attempts, 0, "retrying after cooldown")
 		}
 	case fieldMsg:
+		if m.observeQuota(msg.provenance.Quota) {
+			cmds = append(cmds, m.quotaRefreshCmd())
+		}
 		fieldSlotFreed := false
 		if msg.key.Name != "activity" && m.fieldInFlight[msg.key] == msg.generation {
 			delete(m.fieldInFlight, msg.key)
@@ -646,6 +725,7 @@ func (m Model) detailsView() string {
 		m.visual.paint(roleMuted, "Review and check signals are summarized in the list; detailed review threads arrive in change 03."),
 	}
 	lines := append(m.visual.header("fs-dash · PR details", pr.ID.Repo, m.width), m.visual.panel("Pull request", content, m.width)...)
+	lines = append(lines, m.quotaStatusLine())
 	if m.status != "" {
 		lines = append(lines, m.visual.paint(roleWarning, m.visual.fit(m.status, m.width)))
 	}

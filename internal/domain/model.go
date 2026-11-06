@@ -36,6 +36,17 @@ type TimelineActivity struct {
 type PRList struct {
 	PullRequests []PR
 	ViewerLogin  string
+	Quota        *QuotaObservation
+}
+
+// QuotaObservation records primary API quota metadata returned by a GitHub response.
+type QuotaObservation struct {
+	Limit      int
+	Used       int
+	Remaining  int
+	ResetAt    time.Time
+	Resource   string
+	ObservedAt time.Time
 }
 
 type AssigneeSet struct {
@@ -70,6 +81,7 @@ type Provenance struct {
 	FetchedAt  time.Time
 	Version    string
 	FreshUntil time.Time
+	Quota      *QuotaObservation
 }
 
 type ErrorKind string
