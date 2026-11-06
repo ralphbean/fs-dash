@@ -41,16 +41,17 @@ const (
 )
 
 const (
-	columnStar      tableColumn = "star"
-	columnPR        tableColumn = "pr"
-	columnTitle     tableColumn = "title"
-	columnAuthor    tableColumn = "author"
-	columnAssignees tableColumn = "assignees"
-	columnUpdated   tableColumn = "updated"
-	columnChecks    tableColumn = "checks"
-	columnReview    tableColumn = "review"
-	columnThreads   tableColumn = "threads"
-	columnWake      tableColumn = "wake"
+	columnStar        tableColumn = "star"
+	columnPR          tableColumn = "pr"
+	columnTitle       tableColumn = "title"
+	columnAuthor      tableColumn = "author"
+	columnAssignees   tableColumn = "assignees"
+	columnUpdated     tableColumn = "updated"
+	columnChecks      tableColumn = "checks"
+	columnHumanReview tableColumn = "human_review"
+	columnBotReview   tableColumn = "bot_review"
+	columnThreads     tableColumn = "threads"
+	columnWake        tableColumn = "wake"
 
 	alignLeft tableAlignment = iota
 	alignCenter
@@ -157,7 +158,8 @@ func listTableSpecs(withWake bool) []tableColumnSpec {
 		{column: columnAssignees, label: "Assignees", min: 10, max: 22, align: alignLeft},
 		{column: columnUpdated, label: "Updated", min: 13, max: 13, align: alignRight},
 		{column: columnChecks, label: "Checks", emojiLabel: "🧪", min: 9, max: 9, align: alignCenter},
-		{column: columnReview, label: "Review", emojiLabel: "👀", min: 12, max: 12, align: alignCenter},
+		{column: columnHumanReview, label: "Human review", emojiLabel: "👤", min: 12, max: 12, align: alignCenter},
+		{column: columnBotReview, label: "Bot review", emojiLabel: "🤖", min: 10, max: 10, align: alignCenter},
 		{column: columnThreads, label: "Threads", emojiLabel: "🧵", min: 7, max: 7, align: alignRight},
 	}
 	if withWake {
@@ -213,8 +215,10 @@ func (m Model) tableCellFor(row triage.Row, column tableColumn) tableCell {
 		return m.updatedCell(row.PR)
 	case columnChecks:
 		return m.checksCell(row.PR)
-	case columnReview:
-		return m.reviewValue(row.PR)
+	case columnHumanReview:
+		return m.reviewValue(row.PR, false)
+	case columnBotReview:
+		return m.reviewValue(row.PR, true)
 	case columnThreads:
 		return m.threadsCell(row.PR)
 	case columnWake:
@@ -323,12 +327,7 @@ func (m Model) checksCell(pr domain.PR) tableCell {
 	return stateCell(cellChecksPass, "pass", roleSuccess)
 }
 
-func (m Model) reviewCell(pr domain.PR) (string, visualRole) {
-	cell := m.reviewValue(pr)
-	return cell.render(tableDisplayText), cell.role
-}
-
-func (m Model) reviewValue(pr domain.PR) tableCell {
+func (m Model) reviewValue(pr domain.PR, bot bool) tableCell {
 	f := m.fieldFor(pr, "reviews")
 	if f == nil {
 		return stateCell(cellPending, "pending", roleUnrequested)
@@ -358,6 +357,9 @@ func (m Model) reviewValue(pr domain.PR) tableCell {
 	}
 	approved, changesRequested, commented := false, false, false
 	for _, review := range effective {
+		if review.IsBot != bot {
+			continue
+		}
 		switch strings.ToUpper(review.State) {
 		case "CHANGES_REQUESTED":
 			changesRequested = true

@@ -16,8 +16,8 @@ import (
 
 func TestListTableColumnOrderAndAlignment(t *testing.T) {
 	specs := listTableSpecs(false)
-	wantColumns := []tableColumn{columnStar, columnPR, columnTitle, columnAuthor, columnAssignees, columnUpdated, columnChecks, columnReview, columnThreads}
-	wantAlignments := []tableAlignment{alignCenter, alignLeft, alignLeft, alignLeft, alignLeft, alignRight, alignCenter, alignCenter, alignRight}
+	wantColumns := []tableColumn{columnStar, columnPR, columnTitle, columnAuthor, columnAssignees, columnUpdated, columnChecks, columnHumanReview, columnBotReview, columnThreads}
+	wantAlignments := []tableAlignment{alignCenter, alignLeft, alignLeft, alignLeft, alignLeft, alignRight, alignCenter, alignCenter, alignCenter, alignRight}
 	if len(specs) != len(wantColumns) {
 		t.Fatalf("normal table has %d columns, want %d", len(specs), len(wantColumns))
 	}
@@ -91,19 +91,22 @@ func TestCompactColumnPresentationAndWidths(t *testing.T) {
 	m.width = 220
 	m.sections[0].field.Succeed(m.sections[0].field.Generation, []domain.PR{pr}, domain.Provenance{Version: "list-v1", FreshUntil: now.Add(time.Hour)})
 	putField(&m, pr, "checks", domain.CheckSummary{Failed: 12, Total: 12, Complete: true}, now)
-	putField(&m, pr, "reviews", domain.ReviewSet{Reviews: []domain.Review{{Author: "reviewer", State: "APPROVED"}}, Complete: true}, now)
+	putField(&m, pr, "reviews", domain.ReviewSet{Reviews: []domain.Review{
+		{Author: "reviewer", State: "APPROVED"},
+		{Author: "renovate[bot]", IsBot: true, State: "CHANGES_REQUESTED"},
+	}, Complete: true}, now)
 	putField(&m, pr, "review_threads", domain.ThreadSummary{Unresolved: 123, Complete: false}, now)
 	row := m.projection().Review[0]
 
 	emojiSpecs, emojiWidths := m.tableColumns([]triage.Row{row}, false)
 	emojiHeader := ansi.Strip(m.renderTableHeader(emojiSpecs, emojiWidths))
 	emojiRow := ansi.Strip(m.renderTableRow(row, emojiSpecs, emojiWidths, false))
-	for _, want := range []string{"🧪", "👀", "🧵"} {
+	for _, want := range []string{"🧪", "👤", "🤖", "🧵"} {
 		if !strings.Contains(emojiHeader, want) {
 			t.Errorf("emoji header lacks %q: %q", want, emojiHeader)
 		}
 	}
-	for _, want := range []string{"❌12", "✅", "123+"} {
+	for _, want := range []string{"❌12", "✅", "🛑", "123+"} {
 		if !strings.Contains(emojiRow, want) {
 			t.Errorf("emoji row lacks %q: %q", want, emojiRow)
 		}
@@ -122,17 +125,17 @@ func TestCompactColumnPresentationAndWidths(t *testing.T) {
 	textSpecs, textWidths := m.tableColumns([]triage.Row{row}, false)
 	textHeader := ansi.Strip(m.renderTableHeader(textSpecs, textWidths))
 	textRow := ansi.Strip(m.renderTableRow(row, textSpecs, textWidths, false))
-	for _, want := range []string{"Checks", "Review", "Threads"} {
+	for _, want := range []string{"Checks", "Human review", "Bot review", "Threads"} {
 		if !strings.Contains(textHeader, want) {
 			t.Errorf("text header lacks %q: %q", want, textHeader)
 		}
 	}
-	for _, want := range []string{"fail 12", "approved", "123+"} {
+	for _, want := range []string{"fail 12", "approved", "changes", "123+"} {
 		if !strings.Contains(textRow, want) {
 			t.Errorf("text row lacks %q: %q", want, textRow)
 		}
 	}
-	for _, column := range []tableColumn{columnChecks, columnReview, columnThreads} {
+	for _, column := range []tableColumn{columnChecks, columnHumanReview, columnBotReview, columnThreads} {
 		for i, spec := range textSpecs {
 			if spec.column == column && emojiWidth(column) >= textWidths[i] {
 				t.Errorf("%s width = %d in emoji mode, want narrower than text width %d", column, emojiWidth(column), textWidths[i])
@@ -224,7 +227,7 @@ func TestSnoozedTableAddsWakeColumn(t *testing.T) {
 	}
 	m.emojiMode = false
 	textView := ansi.Strip(m.View())
-	if !strings.Contains(textView, "Checks") || !strings.Contains(textView, "Review") || !strings.Contains(textView, "Threads") {
+	if !strings.Contains(textView, "Checks") || !strings.Contains(textView, "Human review") || !strings.Contains(textView, "Bot review") || !strings.Contains(textView, "Threads") {
 		t.Fatalf("text mode was not used in the Snoozed section: %s", textView)
 	}
 }

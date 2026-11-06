@@ -153,12 +153,16 @@ The system SHALL populate check, review, and unresolved review-thread summaries 
 - **THEN** the corresponding table indicator updates to its current result or failure state, and unknown data is never shown as a confirmed negative
 
 ### Requirement: Table review state combines current human and bot reviews
-The system SHALL provide one overall current review state derived from effective human and bot reviews, while keeping incomplete review history distinct from a definitive state.
+The system SHALL expose separate current review states for human reviewers and bot reviewers, derived from the effective reviews for each author type. Each state SHALL use the existing review-state precedence and freshness behavior, and incomplete review history SHALL remain distinct from a definitive state.
 
-#### Scenario: Current review state is known
+#### Scenario: Current human and bot review states are known
 - **WHEN** review history is complete for the current PR revision
-- **THEN** the table review summary reflects the overall current review state
+- **THEN** the Human review state reflects effective user-authored reviews and the Bot review state reflects effective bot-authored reviews
+
+#### Scenario: A reviewer type has no current reviews
+- **WHEN** review history is complete and there are no effective reviews for one reviewer type
+- **THEN** that review state shows awaiting while the other reviewer type retains its own current state
 
 #### Scenario: Review history is incomplete
 - **WHEN** review history is pending, incomplete, or failed
-- **THEN** the review summary remains pending or failed rather than appearing as no review
+- **THEN** both source-specific review states remain pending or failed rather than appearing as no review
