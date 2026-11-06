@@ -71,7 +71,7 @@ func TestRenderedSectionStatesUseDistinctSemanticRoles(t *testing.T) {
 	}
 	seen := map[visualRole]bool{}
 	for _, field := range states {
-		_, role := m.sectionStatus(section{field: field})
+		_, role := m.sectionStatus(section{field: field}, m.projection())
 		if seen[role] {
 			t.Fatalf("rendered section states share a semantic treatment: %q", role)
 		}

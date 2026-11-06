@@ -88,7 +88,7 @@ func TestCompactColumnPresentationAndWidths(t *testing.T) {
 	pr := testUIPr(43, now)
 	pr.Assignees = domain.AssigneeSet{Logins: []string{"me"}, Complete: true}
 	m := New(Options{Config: config.Default(), Repos: []string{"owner/repo"}, Clock: &testClock{now: now}})
-	m.width = 220
+	m.width = 120
 	m.sections[0].field.Succeed(m.sections[0].field.Generation, []domain.PR{pr}, domain.Provenance{Version: "list-v1", FreshUntil: now.Add(time.Hour)})
 	putField(&m, pr, "checks", domain.CheckSummary{Failed: 12, Total: 12, Complete: true}, now)
 	putField(&m, pr, "reviews", domain.ReviewSet{Reviews: []domain.Review{

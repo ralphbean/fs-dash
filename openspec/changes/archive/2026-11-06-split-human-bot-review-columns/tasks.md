@@ -11,5 +11,5 @@
 
 ## 3. Validate the change
 
-- [ ] 3.1 Run the relevant Go tests and full repository checks, then run strict OpenSpec validation and resolve any failures.
-- [ ] 3.2 Review the table in text and emoji modes at standard and narrow terminal sizes, including no-color mode.
+- [x] 3.1 Run the relevant Go tests and full repository checks, then run strict OpenSpec validation and resolve any failures.
+- [x] 3.2 Review the table in text and emoji modes at standard and narrow terminal sizes, including no-color mode.

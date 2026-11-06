@@ -59,12 +59,13 @@ func TestSummaryFieldsUseOneBatchRequestPerPRRevision(t *testing.T) {
 	now := time.Now()
 	pr := testUIPr(7, now)
 	m := New(Options{Config: config.Default(), Repos: []string{"owner/repo"}, Enricher: enricher})
+	m.width, m.height, m.viewer, m.filter = 100, 30, "me", triage.FilterAll
 	m.sections[0].field.Succeed(m.sections[0].field.Generation, []domain.PR{pr}, domain.Provenance{Source: "github", FreshUntil: now.Add(time.Hour)})
 	m.selected, m.hasSelection = pr.ID, true
 	m.fieldOffscreenWakeReady = true
 	item := pr.ID
 	for _, name := range []string{"checks", "reviews", "review_requests", "review_threads"} {
-		m.queueField(domain.FieldKey{Item: item, Name: name, Revision: "head"}, false)
+		m.queueField(domain.FieldKey{Item: item, Name: name, Revision: pr.HeadSHA}, false)
 	}
 	cmds := m.startFieldFetches()
 	if len(cmds) != 1 || len(m.fieldInFlight) != 4 || len(m.fieldRequestsInFlight) != 1 {
@@ -76,7 +77,7 @@ func TestSummaryFieldsUseOneBatchRequestPerPRRevision(t *testing.T) {
 		t.Fatalf("batch calls=%d fields=%+v", enricher.calls, enricher.keys)
 	}
 	for _, name := range []string{"checks", "reviews", "review_requests", "review_threads"} {
-		key := domain.FieldKey{Item: item, Name: name, Revision: "head"}
+		key := domain.FieldKey{Item: item, Name: name, Revision: pr.HeadSHA}
 		if field := m.fields[key]; field == nil || field.Phase != domain.Ready {
 			t.Errorf("%s field did not settle from the shared response: %+v", name, field)
 		}
@@ -87,9 +88,32 @@ func TestOffscreenEnrichmentIsPacedOneRequestAtATime(t *testing.T) {
 	enricher := testutil.Enricher{Fn: func(context.Context, domain.FieldKey) (any, domain.Provenance, error) {
 		return domain.CheckSummary{Complete: true}, domain.Provenance{Source: "github"}, nil
 	}}
-	m := New(Options{Config: config.Default(), Enricher: enricher})
-	first := domain.FieldKey{Item: testUIPr(1, time.Now()).ID, Name: "checks", Revision: "head-1"}
-	second := domain.FieldKey{Item: testUIPr(2, time.Now()).ID, Name: "checks", Revision: "head-2"}
+	now := time.Now()
+	prs := make([]domain.PR, 8)
+	for i := range prs {
+		prs[i] = testUIPr(i+1, now.Add(-time.Duration(i)*time.Minute))
+	}
+	m := New(Options{Config: config.Default(), Repos: []string{"owner/repo"}, Enricher: enricher})
+	m.width, m.height, m.filter = 40, 12, triage.FilterAll
+	m.sections[0].field.Succeed(m.sections[0].field.Generation, prs, domain.Provenance{FreshUntil: now.Add(time.Hour)})
+	visible := make(map[domain.ItemID]bool)
+	for _, pr := range m.visibleRowsForPrefetch() {
+		visible[pr.ID] = true
+	}
+	offscreen := make([]domain.PR, 0, 2)
+	for _, pr := range prs {
+		if !visible[pr.ID] {
+			offscreen = append(offscreen, pr)
+			if len(offscreen) == 2 {
+				break
+			}
+		}
+	}
+	if len(offscreen) != 2 {
+		t.Fatalf("expected at least two offscreen PRs, got %d visible of %d", len(visible), len(prs))
+	}
+	first := domain.FieldKey{Item: offscreen[0].ID, Name: "checks", Revision: offscreen[0].HeadSHA}
+	second := domain.FieldKey{Item: offscreen[1].ID, Name: "checks", Revision: offscreen[1].HeadSHA}
 	m.queueField(first, false)
 	m.queueField(second, false)
 	if cmds := m.startFieldFetches(); len(cmds) != 1 || len(m.fieldInFlight) != 0 || !m.fieldOffscreenWakeRunning {
@@ -344,7 +368,7 @@ func TestBackgroundSummaryPrefetchIsBoundedAndDoesNotDelayList(t *testing.T) {
 	if field := m.fields[reviewKey]; field == nil || field.Phase != domain.Failed {
 		t.Fatalf("terminal summary failure did not settle: %+v", field)
 	}
-	if text, _ := m.reviewCell(prs[0]); text != "failed" {
+	if text := m.reviewValue(prs[0], false).render(tableDisplayText); text != "failed" {
 		t.Fatalf("failed review summary rendered as %q", text)
 	}
 }
@@ -362,7 +386,7 @@ func TestBackgroundPrefetchPromotesVisibleRowsAheadOfOffscreenRows(t *testing.T)
 	m.sections[0].field.Succeed(m.sections[0].field.Generation, prs, domain.Provenance{Version: "list-v1", FreshUntil: now.Add(time.Hour)})
 	m.selected, m.hasSelection = prs[12].ID, true
 	m.opts.Enricher = testutil.Enricher{}
-	m.enqueueListSummaries(prs)
+	m.enqueueListPrefetch("owner/repo", m.sections[0].field.Generation, prs)
 	visibleRows := m.visibleRowsForPrefetch()
 	if len(visibleRows) == 0 || len(visibleRows) >= len(prs) {
 		t.Fatalf("expected a partial visible viewport, got %d of %d rows", len(visibleRows), len(prs))
@@ -387,6 +411,7 @@ func TestBackgroundPrefetchPromotesVisibleRowsAheadOfOffscreenRows(t *testing.T)
 		t.Fatalf("visible summary queue is not ahead of off-screen work: visible through %d, off-screen starts %d", lastVisible, firstOffscreen)
 	}
 	m.startFieldFetches()
+	m.startActivityFetches()
 	for key := range m.fieldInFlight {
 		if !visible[key.Item] {
 			t.Errorf("off-screen field started before visible work settled: %s", key)
@@ -395,8 +420,6 @@ func TestBackgroundPrefetchPromotesVisibleRowsAheadOfOffscreenRows(t *testing.T)
 	if m.fieldOffscreenWakeRunning {
 		t.Fatal("off-screen field pacing began while visible work was still pending")
 	}
-	m.enqueueListActivity(prs)
-	m.startActivityFetches()
 	for key := range m.activityInFlight {
 		if !visible[key.Item] {
 			t.Errorf("off-screen activity started before visible work settled: %s", key)
