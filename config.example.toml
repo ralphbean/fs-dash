@@ -5,6 +5,7 @@ theme = "dark" # dark or light
 color = "auto" # auto or never; NO_COLOR is always honored
 
 [bindings.o]
+summary = "Open selected PR"
 executable = "xdg-open"
 args = ["{url}"]
 detach = true
@@ -12,6 +13,7 @@ detach = true
 # Example: launch your own terminal command. Placeholders are substituted in
 # individual arguments without a shell. Set a real working directory.
 # [bindings.c]
+# summary = "Run Codex on the selected PR"
 # executable = "my-terminal-launcher"
 # args = ["codex", "Work on PR {url}"]
 # dir = "/home/me/code/my-project"

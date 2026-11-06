@@ -17,6 +17,7 @@ import (
 )
 
 type Binding struct {
+	Summary    string   `toml:"summary"`
 	Executable string   `toml:"executable"`
 	Args       []string `toml:"args"`
 	Dir        string   `toml:"dir"`
@@ -39,7 +40,7 @@ func Default() Config {
 	if runtime.GOOS == "darwin" {
 		opener = "open"
 	}
-	return Config{Version: 1, LogLimit: 500, Theme: "dark", Color: "auto", Bindings: map[string]Binding{"o": {Executable: opener, Args: []string{"{url}"}, Detach: true}}}
+	return Config{Version: 1, LogLimit: 500, Theme: "dark", Color: "auto", Bindings: map[string]Binding{"o": {Summary: "Open selected PR", Executable: opener, Args: []string{"{url}"}, Detach: true}}}
 }
 
 func DefaultPath() (string, error) {

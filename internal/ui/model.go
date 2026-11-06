@@ -661,7 +661,12 @@ func (m Model) helpView() string {
 	sort.Strings(keys)
 	content := []string{"j/k or arrows  move selection", "h/l            previous/next filter", "e              toggle emoji/text table labels", "enter          PR details", "esc            back", "s              toggle local star", "z              choose snooze duration", "u              unsnooze selected PR", "r              refresh all sections", "L              log console", "?              toggle help", "q              quit"}
 	for _, key := range keys {
-		content = append(content, fmt.Sprintf("%s              %s", key, m.opts.Config.Bindings[key].Executable))
+		binding := m.opts.Config.Bindings[key]
+		summary := binding.Summary
+		if summary == "" {
+			summary = binding.Executable
+		}
+		content = append(content, fmt.Sprintf("%s              %s", key, summary))
 	}
 	content = append(content, "", "Log console: 0 all, 1 debug, 2 info, 3 warn, 4 error; j/k scroll; L close.")
 	lines := append(m.visual.header("fs-dash · Help", "Keyboard shortcuts", m.width), m.visual.panel("Navigation", content, m.width)...)
