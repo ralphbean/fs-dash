@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/fullsend-ai/fs-dash/internal/domain"
+	"github.com/fullsend-ai/fs-dash/internal/fetch"
 )
 
 const listQuery = `query($owner: String!, $name: String!, $endCursor: String) {
@@ -65,7 +66,10 @@ type page struct {
 	} `json:"errors"`
 }
 
-type PRLister struct{ CLI string }
+type PRLister struct {
+	CLI  string
+	Gate *fetch.RateLimitGate
+}
 
 func (l PRLister) ListOpenPRs(ctx context.Context, repository string) (domain.PRList, error) {
 	parts := strings.Split(repository, "/")
@@ -80,31 +84,40 @@ func (l PRLister) ListOpenPRs(ctx context.Context, repository string) (domain.PR
 	cursor := ""
 	seenCursors := map[string]struct{}{}
 	for {
+		if l.Gate != nil {
+			if err := l.Gate.Wait(ctx); err != nil {
+				return result, fetch.Classify(err)
+			}
+		}
 		args := []string{"api", "graphql", "--include", "-f", "query=" + listQuery, "-F", "owner=" + parts[0], "-F", "name=" + parts[1]}
 		if cursor != "" {
 			args = append(args, "-F", "endCursor="+cursor)
 		}
 		output, commandErr := exec.CommandContext(ctx, cli, args...).CombinedOutput()
+		observedAt := time.Now()
 		headers, body, responseErr := parseIncludedResponse(output)
-		observation := parseQuotaObservation(headers, time.Now())
+		observation := parseQuotaObservation(headers, observedAt)
 		result.Quota = conservativeQuota(result.Quota, observation)
 		if commandErr != nil {
 			issue := classifyCLIError(commandErr, string(output))
-			applyQuotaRetry(issue, observation)
+			applyRateLimitMetadata(l.Gate, issue, headers, observation, observedAt)
 			return result, issue
 		}
 		if responseErr != nil {
+			applyRateLimitMetadata(l.Gate, nil, headers, observation, observedAt)
 			return result, &domain.FetchError{Kind: domain.ErrorTransient, Message: "GitHub returned unreadable response metadata"}
 		}
 		var response page
 		if err := json.NewDecoder(bytes.NewReader(body)).Decode(&response); err != nil {
+			applyRateLimitMetadata(l.Gate, nil, headers, observation, observedAt)
 			return result, &domain.FetchError{Kind: domain.ErrorTransient, Message: "GitHub returned unreadable PR data"}
 		}
 		if len(response.Errors) > 0 {
 			issue := classifyCLIError(errors.New("GraphQL error"), response.Errors[0].Message)
-			applyQuotaRetry(issue, observation)
+			applyRateLimitMetadata(l.Gate, issue, headers, observation, observedAt)
 			return result, issue
 		}
+		applyRateLimitMetadata(l.Gate, nil, headers, observation, observedAt)
 		if response.Data.Repository == nil {
 			return result, &domain.FetchError{Kind: domain.ErrorPermission, Message: "GitHub repository unavailable or access denied: " + repository}
 		}
@@ -206,6 +219,41 @@ func conservativeQuota(current, candidate *domain.QuotaObservation) *domain.Quot
 func applyQuotaRetry(issue *domain.FetchError, observation *domain.QuotaObservation) {
 	if issue != nil && issue.Kind == domain.ErrorRateLimit && observation != nil && observation.Remaining == 0 {
 		issue.RetryAt = observation.ResetAt
+	}
+}
+
+func parseRetryAfter(headers http.Header, now time.Time) time.Duration {
+	value := strings.TrimSpace(headers.Get("retry-after"))
+	if value == "" {
+		return 0
+	}
+	if seconds, err := strconv.Atoi(value); err == nil {
+		if seconds <= 0 {
+			return 0
+		}
+		return time.Duration(seconds) * time.Second
+	}
+	if at, err := http.ParseTime(value); err == nil && at.After(now) {
+		return at.Sub(now)
+	}
+	return 0
+}
+
+func applyRateLimitMetadata(gate *fetch.RateLimitGate, issue *domain.FetchError, headers http.Header, quota *domain.QuotaObservation, now time.Time) {
+	retryAfter := parseRetryAfter(headers, now)
+	if issue != nil && issue.Kind == domain.ErrorRateLimit {
+		issue.RetryAfter = retryAfter
+		switch {
+		case quota != nil && quota.Remaining == 0 && quota.ResetAt.After(now):
+			issue.RetryAt = quota.ResetAt
+		case retryAfter > 0:
+			issue.RetryAt = now.Add(retryAfter)
+		case gate == nil:
+			issue.RetryAt = now.Add(time.Minute)
+		}
+	}
+	if gate != nil {
+		gate.ObserveResponse(issue, quota, retryAfter)
 	}
 }
 

@@ -15,6 +15,16 @@ type Enricher interface {
 	FetchField(ctx context.Context, key domain.FieldKey) (any, domain.Provenance, error)
 }
 
+type FieldResult struct {
+	Value      any
+	Provenance domain.Provenance
+	Err        error
+}
+
+type BatchEnricher interface {
+	FetchFields(ctx context.Context, keys []domain.FieldKey) map[domain.FieldKey]FieldResult
+}
+
 type Clock interface{ Now() time.Time }
 
 type LogEvent struct {

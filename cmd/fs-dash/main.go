@@ -7,6 +7,8 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/fullsend-ai/fs-dash/internal/config"
+	"github.com/fullsend-ai/fs-dash/internal/enrichmentcache"
+	"github.com/fullsend-ai/fs-dash/internal/fetch"
 	"github.com/fullsend-ai/fs-dash/internal/github"
 	"github.com/fullsend-ai/fs-dash/internal/localcmd"
 	"github.com/fullsend-ai/fs-dash/internal/preferences"
@@ -67,7 +69,13 @@ func main() {
 	if preferenceErr == nil {
 		preferenceStore = preferences.NewFileStore(preferencesPath)
 	}
-	options := ui.Options{Config: cfg, Repos: repos, Lister: github.PRLister{}, Enricher: github.Enricher{}, Runner: localcmd.Runner{}, Reminders: triageStore, ReminderLoadError: triageErr, DisplayPreferences: preferenceStore, PreferenceLoadError: preferenceErr}
+	cachePath, cacheErr := enrichmentcache.DefaultPath()
+	var enrichmentStore enrichmentcache.Store
+	if cacheErr == nil {
+		enrichmentStore = enrichmentcache.NewFileStore(cachePath)
+	}
+	gate := fetch.NewRateLimitGate()
+	options := ui.Options{Config: cfg, Repos: repos, Lister: github.PRLister{Gate: gate}, Enricher: github.Enricher{Gate: gate}, Runner: localcmd.Runner{}, Reminders: triageStore, ReminderLoadError: triageErr, DisplayPreferences: preferenceStore, PreferenceLoadError: preferenceErr, EnrichmentCache: enrichmentStore, CacheLoadError: cacheErr}
 	if _, err := tea.NewProgram(ui.New(options), tea.WithAltScreen()).Run(); err != nil {
 		fmt.Fprintln(os.Stderr, "fs-dash:", err)
 		os.Exit(1)

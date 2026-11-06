@@ -2,6 +2,7 @@ package ui
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"sort"
 	"strings"
@@ -11,6 +12,7 @@ import (
 	"github.com/fullsend-ai/fs-dash/internal/config"
 	"github.com/fullsend-ai/fs-dash/internal/diag"
 	"github.com/fullsend-ai/fs-dash/internal/domain"
+	"github.com/fullsend-ai/fs-dash/internal/enrichmentcache"
 	"github.com/fullsend-ai/fs-dash/internal/fetch"
 	"github.com/fullsend-ai/fs-dash/internal/ports"
 	"github.com/fullsend-ai/fs-dash/internal/preferences"
@@ -32,6 +34,8 @@ type Options struct {
 	ReminderLoadError   error
 	DisplayPreferences  preferences.Store
 	PreferenceLoadError error
+	EnrichmentCache     enrichmentcache.Store
+	CacheLoadError      error
 }
 type realClock struct{}
 
@@ -55,10 +59,31 @@ type Model struct {
 	status                          string
 	reminderWarning                 string
 	fields                          map[domain.FieldKey]*domain.Field[any]
+	cacheEntries                    map[domain.FieldKey]enrichmentcache.Entry
+	cacheGeneration                 uint64
+	cacheCompletedGeneration        uint64
+	cacheSaveGeneration             uint64
+	cacheSaveRunning                bool
 	fieldAttempts                   map[domain.FieldKey]int
 	fieldQueue                      []domain.FieldKey
 	fieldQueued                     map[domain.FieldKey]bool
+	fieldQueueTokens                []uint64
+	fieldQueueHead                  int
+	fieldQueueGeneration            map[domain.FieldKey]uint64
+	fieldPriorityQueue              []queueRef
+	fieldPriorityHead               int
+	fieldPriorityGeneration         map[domain.FieldKey]uint64
+	fieldQueueChunkRunning          bool
+	prefetchBatches                 []listPrefetchBatch
+	prefetchBatchHead               int
+	prefetchPRIndex                 int
+	prefetchChunkRunning            bool
 	fieldInFlight                   map[domain.FieldKey]uint64
+	fieldRequestForKey              map[domain.FieldKey]string
+	fieldRequestsInFlight           map[string]int
+	fieldOffscreenWakeRunning       bool
+	fieldOffscreenWakeReady         bool
+	fieldOffscreenGeneration        uint64
 	filter                          triage.Filter
 	emojiMode                       bool
 	viewer                          string
@@ -69,7 +94,17 @@ type Model struct {
 	nextWake                        time.Time
 	activityQueue                   []domain.FieldKey
 	activityQueued                  map[domain.FieldKey]bool
+	activityQueueTokens             []uint64
+	activityQueueHead               int
+	activityQueueGeneration         map[domain.FieldKey]uint64
+	activityPriorityQueue           []queueRef
+	activityPriorityHead            int
+	activityPriorityGeneration      map[domain.FieldKey]uint64
+	activityQueueChunkRunning       bool
 	activityInFlight                map[domain.FieldKey]uint64
+	activityOffscreenWakeRunning    bool
+	activityOffscreenWakeReady      bool
+	activityOffscreenGeneration     uint64
 	visual                          visualTheme
 }
 type listMsg struct {
@@ -85,6 +120,7 @@ type listMsg struct {
 }
 type fieldMsg struct {
 	key        domain.FieldKey
+	requestKey string
 	generation uint64
 	value      any
 	provenance domain.Provenance
@@ -92,6 +128,15 @@ type fieldMsg struct {
 	at         time.Time
 	attempt    int
 }
+type fieldBatchMsg struct{ fields []fieldMsg }
+type cacheSaveMsg struct {
+	generation uint64
+	entries    []enrichmentcache.Entry
+	err        error
+}
+type fieldQueueChunkMsg struct{}
+type activityQueueChunkMsg struct{}
+type listPrefetchChunkMsg struct{}
 type fieldRetryMsg struct {
 	key        domain.FieldKey
 	generation uint64
@@ -102,6 +147,8 @@ type retryMsg struct {
 }
 type tickMsg time.Time
 type wakeMsg struct{ generation uint64 }
+type fieldOffscreenWakeMsg struct{ generation uint64 }
+type activityOffscreenWakeMsg struct{ generation uint64 }
 type quotaTickMsg struct{ generation uint64 }
 type commandMsg struct {
 	key string
@@ -123,11 +170,10 @@ func New(opts Options) Model {
 		opts.Config.Color = "auto"
 	}
 	if opts.Scheduler == nil {
-		opts.Scheduler = fetch.NewScheduler(2, 20*time.Second)
+		opts.Scheduler = fetch.NewRateLimitedScheduler(2, 150*time.Millisecond, 20*time.Second)
 	}
-	if opts.ActivityScheduler == nil {
-		opts.ActivityScheduler = fetch.NewScheduler(maxConcurrentActivityFetches, 20*time.Second)
-	}
+	// Activity, detail, and list requests share one source limit and start pace.
+	opts.ActivityScheduler = opts.Scheduler
 	if opts.Logs == nil {
 		opts.Logs = diag.New(opts.Config.LogLimit)
 	}
@@ -137,7 +183,7 @@ func New(opts Options) Model {
 	if opts.Reminders == nil {
 		opts.Reminders = reminder.NewMemoryStore()
 	}
-	m := Model{opts: opts, mode: "list", logLevel: "all", width: 100, height: 30, fields: map[domain.FieldKey]*domain.Field[any]{}, fieldAttempts: map[domain.FieldKey]int{}, fieldQueued: map[domain.FieldKey]bool{}, fieldInFlight: map[domain.FieldKey]uint64{}, activityQueued: map[domain.FieldKey]bool{}, activityInFlight: map[domain.FieldKey]uint64{}, filter: triage.FilterAuthored, emojiMode: true, visual: newVisualTheme(opts.Config)}
+	m := Model{opts: opts, mode: "list", logLevel: "all", width: 100, height: 30, fields: map[domain.FieldKey]*domain.Field[any]{}, cacheEntries: map[domain.FieldKey]enrichmentcache.Entry{}, fieldAttempts: map[domain.FieldKey]int{}, fieldQueued: map[domain.FieldKey]bool{}, fieldQueueGeneration: map[domain.FieldKey]uint64{}, fieldPriorityGeneration: map[domain.FieldKey]uint64{}, fieldInFlight: map[domain.FieldKey]uint64{}, fieldRequestForKey: map[domain.FieldKey]string{}, fieldRequestsInFlight: map[string]int{}, activityQueued: map[domain.FieldKey]bool{}, activityQueueGeneration: map[domain.FieldKey]uint64{}, activityPriorityGeneration: map[domain.FieldKey]uint64{}, activityInFlight: map[domain.FieldKey]uint64{}, filter: triage.FilterAuthored, emojiMode: true, visual: newVisualTheme(opts.Config)}
 	m.visual.compact = m.width < 64
 	if opts.ReminderLoadError != nil {
 		m.reminderWarning = "Local triage state: " + opts.ReminderLoadError.Error()
@@ -152,6 +198,17 @@ func New(opts Options) Model {
 	if opts.PreferenceLoadError != nil {
 		m.status = "Local preferences: " + opts.PreferenceLoadError.Error()
 	}
+	if opts.CacheLoadError != nil {
+		m.appendLocalWarning("Local enrichment cache: " + opts.CacheLoadError.Error())
+	}
+	if opts.EnrichmentCache != nil {
+		entries, err := opts.EnrichmentCache.Load()
+		if err != nil {
+			m.appendLocalWarning("Local enrichment cache: " + err.Error())
+		} else {
+			m.restoreCache(entries)
+		}
+	}
 	for _, repo := range opts.Repos {
 		f := domain.NewField[[]domain.PR]()
 		g := f.Queue()
@@ -160,6 +217,127 @@ func New(opts Options) Model {
 		m.log("debug", "queue-list", repo, 1, 0, "queued initial list request")
 	}
 	return m
+}
+
+func (m *Model) appendLocalWarning(warning string) {
+	if m.reminderWarning == "" {
+		m.reminderWarning = warning
+		return
+	}
+	m.reminderWarning += " · " + warning
+}
+
+func (m *Model) restoreCache(entries []enrichmentcache.Entry) {
+	for _, entry := range enrichmentcache.Prune(entries, m.opts.Clock.Now(), enrichmentcache.DefaultMaxSize) {
+		value, ok := decodeCachedValue(entry.Key.Name, entry.Value)
+		if !ok {
+			continue
+		}
+		field := domain.NewField[any]()
+		generation := field.Queue()
+		field.Begin(generation)
+		field.Succeed(generation, value, entry.Provenance)
+		m.fields[entry.Key] = &field
+		m.cacheEntries[entry.Key] = entry
+	}
+}
+
+func (m *Model) cacheField(key domain.FieldKey, value any, provenance domain.Provenance) {
+	if m.opts.EnrichmentCache == nil || provenance.FetchedAt.IsZero() || provenance.FreshUntil.IsZero() {
+		return
+	}
+	encoded, err := json.Marshal(value)
+	if err != nil {
+		m.appendLocalWarning("Local enrichment cache: encode failed")
+		return
+	}
+	m.cacheEntries[key] = enrichmentcache.Entry{Key: key, Value: encoded, Provenance: provenance, LastAccess: m.opts.Clock.Now()}
+	m.cacheGeneration++
+}
+
+func (m *Model) touchCacheForPRs(prs []domain.PR) {
+	if len(m.cacheEntries) == 0 {
+		return
+	}
+	touched := make(map[prRevision]struct{}, len(prs))
+	for _, pr := range prs {
+		touched[prRevision{item: pr.ID, revision: pr.HeadSHA}] = struct{}{}
+	}
+	now := m.opts.Clock.Now()
+	updated := false
+	for key, entry := range m.cacheEntries {
+		if _, ok := touched[prRevision{item: key.Item, revision: key.Revision}]; ok && !entry.LastAccess.Equal(now) {
+			entry.LastAccess = now
+			m.cacheEntries[key] = entry
+			updated = true
+		}
+	}
+	if updated {
+		m.cacheGeneration++
+	}
+}
+
+func (m *Model) scheduleCacheSave() tea.Cmd {
+	if m.opts.EnrichmentCache == nil || m.cacheSaveRunning || m.cacheGeneration <= m.cacheCompletedGeneration {
+		return nil
+	}
+	entries := make([]enrichmentcache.Entry, 0, len(m.cacheEntries))
+	for _, entry := range m.cacheEntries {
+		entries = append(entries, entry)
+	}
+	generation := m.cacheGeneration
+	now := m.opts.Clock.Now()
+	store := m.opts.EnrichmentCache
+	m.cacheSaveGeneration = generation
+	m.cacheSaveRunning = true
+	return func() tea.Msg {
+		entries = enrichmentcache.Prune(entries, now, enrichmentcache.DefaultMaxSize)
+		err := store.Save(entries)
+		return cacheSaveMsg{generation: generation, entries: entries, err: err}
+	}
+}
+
+func decodeCachedValue(name string, encoded []byte) (any, bool) {
+	var value any
+	switch name {
+	case "checks":
+		value = &domain.CheckSummary{}
+	case "reviews":
+		value = &domain.ReviewSet{}
+	case "review_requests", "assignees":
+		value = &domain.LoginSet{}
+	case "review_threads":
+		value = &domain.ThreadSummary{}
+	case "activity":
+		value = &domain.ActivityEvidence{}
+	case "last_touched":
+		value = &domain.TimelineActivity{}
+	default:
+		return nil, false
+	}
+	if err := json.Unmarshal(encoded, value); err != nil {
+		return nil, false
+	}
+	return dereferenceCachedValue(value), true
+}
+
+func dereferenceCachedValue(value any) any {
+	switch typed := value.(type) {
+	case *domain.CheckSummary:
+		return *typed
+	case *domain.ReviewSet:
+		return *typed
+	case *domain.LoginSet:
+		return *typed
+	case *domain.ThreadSummary:
+		return *typed
+	case *domain.ActivityEvidence:
+		return *typed
+	case *domain.TimelineActivity:
+		return *typed
+	default:
+		return value
+	}
 }
 func spinnerTick() tea.Cmd {
 	return tea.Tick(100*time.Millisecond, func(t time.Time) tea.Msg { return tickMsg(t) })
@@ -210,13 +388,42 @@ func (m Model) fetchField(key domain.FieldKey, generation uint64, attempt int) t
 					p domain.Provenance
 				}).p
 			}
-			return fieldMsg{key: key, generation: generation, provenance: provenance, err: err, at: m.opts.Clock.Now(), attempt: attempt}
+			return fieldMsg{key: key, requestKey: key.String(), generation: generation, provenance: provenance, err: err, at: m.opts.Clock.Now(), attempt: attempt}
 		}
 		result := value.(struct {
 			v any
 			p domain.Provenance
 		})
-		return fieldMsg{key: key, generation: generation, value: result.v, provenance: result.p, at: m.opts.Clock.Now(), attempt: attempt}
+		return fieldMsg{key: key, requestKey: key.String(), generation: generation, value: result.v, provenance: result.p, at: m.opts.Clock.Now(), attempt: attempt}
+	}
+}
+
+func (m Model) fetchFields(keys []domain.FieldKey, generations []uint64, attempts []int, requestKey string) tea.Cmd {
+	return func() tea.Msg {
+		batch, ok := m.opts.Enricher.(ports.BatchEnricher)
+		if !ok {
+			return fieldBatchMsg{}
+		}
+		value, err := m.opts.Scheduler.Do(context.Background(), "github", requestKey, func(ctx context.Context) (any, error) {
+			return batch.FetchFields(ctx, keys), nil
+		})
+		results := map[domain.FieldKey]ports.FieldResult{}
+		if value != nil {
+			results = value.(map[domain.FieldKey]ports.FieldResult)
+		}
+		at := m.opts.Clock.Now()
+		fields := make([]fieldMsg, 0, len(keys))
+		for i, key := range keys {
+			result, found := results[key]
+			if !found {
+				result.Err = err
+				if result.Err == nil {
+					result.Err = fmt.Errorf("combined GitHub response omitted %s", key.Name)
+				}
+			}
+			fields = append(fields, fieldMsg{key: key, requestKey: requestKey, generation: generations[i], value: result.Value, provenance: result.Provenance, err: result.Err, at: at, attempt: attempts[i]})
+		}
+		return fieldBatchMsg{fields: fields}
 	}
 }
 func (m *Model) observeQuota(observation *domain.QuotaObservation) bool {
@@ -299,12 +506,10 @@ func (m *Model) ensureSelection() {
 	m.selected, m.hasSelection = rows[0].ID, true
 }
 func (m Model) selectedPR() (domain.PR, bool) {
-	for _, pr := range m.allRows() {
-		if m.hasSelection && pr.ID == m.selected {
-			return pr, true
-		}
+	if !m.hasSelection {
+		return domain.PR{}, false
 	}
-	return domain.PR{}, false
+	return selectedPRFromSections(m.projection(), m.selected)
 }
 func (m *Model) move(delta int) {
 	rows := m.allRows()
@@ -367,8 +572,8 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.width, m.height = msg.Width, msg.Height
 		m.visual.compact = msg.Width < 64
-		m.prioritizeQueuedFields()
 		cmds = append(cmds, m.startFieldFetches()...)
+		cmds = append(cmds, m.startActivityFetches()...)
 	case tickMsg:
 		m.tickRunning = false
 		m.frame = (m.frame + 1) % len(frames)
@@ -378,6 +583,29 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			m.nextWake = time.Time{}
 			m.ensureSelection()
 		}
+	case fieldOffscreenWakeMsg:
+		if msg.generation == m.fieldOffscreenGeneration {
+			m.fieldOffscreenWakeRunning = false
+			m.fieldOffscreenWakeReady = true
+			cmds = append(cmds, m.startFieldFetches()...)
+		}
+	case activityOffscreenWakeMsg:
+		if msg.generation == m.activityOffscreenGeneration {
+			m.activityOffscreenWakeRunning = false
+			m.activityOffscreenWakeReady = true
+			cmds = append(cmds, m.startActivityFetches()...)
+		}
+	case fieldQueueChunkMsg:
+		m.fieldQueueChunkRunning = false
+		cmds = append(cmds, m.startFieldFetches()...)
+	case activityQueueChunkMsg:
+		m.activityQueueChunkRunning = false
+		cmds = append(cmds, m.startActivityFetches()...)
+	case listPrefetchChunkMsg:
+		m.prefetchChunkRunning = false
+		cmds = append(cmds, m.processListPrefetchChunk())
+		cmds = append(cmds, m.startFieldFetches()...)
+		cmds = append(cmds, m.startActivityFetches()...)
 	case quotaTickMsg:
 		if msg.generation == m.quotaGeneration {
 			cmds = append(cmds, m.quotaRefreshCmd())
@@ -413,8 +641,8 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 				m.viewer = msg.viewer
 			}
 			m.ensureSelection()
-			m.enqueueListSummaries(msg.value)
-			m.enqueueListActivity(msg.value)
+			m.touchCacheForPRs(msg.value)
+			cmds = append(cmds, m.enqueueListPrefetch(msg.repo, msg.generation, msg.value))
 			cmds = append(cmds, m.selectedFields(false)...)
 		}
 	case retryMsg:
@@ -427,60 +655,25 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			m.log("info", "retry-list", s.repo, s.attempts, 0, "retrying after cooldown")
 		}
 	case fieldMsg:
-		if m.observeQuota(msg.provenance.Quota) {
-			cmds = append(cmds, m.quotaRefreshCmd())
+		cmds = append(cmds, m.applyFieldMessage(msg, true)...)
+	case fieldBatchMsg:
+		for _, field := range msg.fields {
+			cmds = append(cmds, m.applyFieldMessage(field, false)...)
 		}
-		fieldSlotFreed := false
-		if msg.key.Name != "activity" && m.fieldInFlight[msg.key] == msg.generation {
-			delete(m.fieldInFlight, msg.key)
-			fieldSlotFreed = true
-		}
-		if msg.key.Name == "activity" && m.activityInFlight[msg.key] == msg.generation {
-			delete(m.activityInFlight, msg.key)
-			cmds = append(cmds, m.startActivityFetches()...)
-		}
-		f := m.fields[msg.key]
-		if f == nil || f.Generation != msg.generation {
-			if fieldSlotFreed {
-				m.prioritizeQueuedFields()
-				cmds = append(cmds, m.startFieldFetches()...)
-			}
-			break
-		}
-		if msg.err != nil {
-			issue := fetch.Classify(msg.err)
-			retryAt := fetch.RetryAt(issue, msg.attempt, msg.at)
-			f.Fail(msg.generation, issue, retryAt)
-			if !retryAt.IsZero() {
-				cmds = append(cmds, tea.Tick(max(time.Until(retryAt), time.Millisecond), func(time.Time) tea.Msg { return fieldRetryMsg{key: msg.key, generation: msg.generation} }))
-			}
-			m.log("error", "fetch-field", msg.key.String(), msg.attempt, 0, issue.Message)
-		} else {
-			f.Succeed(msg.generation, msg.value, msg.provenance)
-			m.fieldAttempts[msg.key] = 0
-			switch value := msg.value.(type) {
-			case domain.ReviewSet:
-				if value.ViewerLogin != "" {
-					m.viewer = value.ViewerLogin
-				}
-			case domain.LoginSet:
-				if value.ViewerLogin != "" {
-					m.viewer = value.ViewerLogin
+		cmds = append(cmds, m.startFieldFetches()...)
+		cmds = append(cmds, m.startActivityFetches()...)
+	case cacheSaveMsg:
+		if m.cacheSaveRunning && msg.generation == m.cacheSaveGeneration {
+			m.cacheSaveRunning = false
+			m.cacheCompletedGeneration = msg.generation
+			if msg.err != nil {
+				m.appendLocalWarning("Local enrichment cache: save failed")
+			} else if msg.generation == m.cacheGeneration {
+				m.cacheEntries = make(map[domain.FieldKey]enrichmentcache.Entry, len(msg.entries))
+				for _, entry := range msg.entries {
+					m.cacheEntries[entry.Key] = entry
 				}
 			}
-			previousSelection, previouslyHadSelection := m.selected, m.hasSelection
-			m.ensureSelection()
-			if m.selected != previousSelection || m.hasSelection != previouslyHadSelection {
-				if selected, ok := m.selectedPR(); ok {
-					m.discardQueuedFieldsExcept(selected.ID, selected.HeadSHA)
-				} else {
-					m.discardQueuedFieldsExcept(domain.ItemID{}, "")
-				}
-			}
-		}
-		if fieldSlotFreed {
-			m.prioritizeQueuedFields()
-			cmds = append(cmds, m.startFieldFetches()...)
 		}
 	case fieldRetryMsg:
 		f := m.fields[msg.key]
@@ -490,7 +683,6 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 				cmds = append(cmds, m.startActivityFetches()...)
 			} else {
 				m.queueField(msg.key, true)
-				m.prioritizeQueuedFields()
 				cmds = append(cmds, m.startFieldFetches()...)
 			}
 		}
@@ -656,14 +848,86 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 	}
+	if cacheSave := m.scheduleCacheSave(); cacheSave != nil {
+		cmds = append(cmds, cacheSave)
+	}
 	if wake := m.scheduleWake(); wake != nil {
 		cmds = append(cmds, wake)
 	}
 	m.maybeTick(&cmds)
 	return m, tea.Batch(cmds...)
 }
+
+func (m *Model) applyFieldMessage(msg fieldMsg, startNext bool) []tea.Cmd {
+	var cmds []tea.Cmd
+	if m.observeQuota(msg.provenance.Quota) {
+		cmds = append(cmds, m.quotaRefreshCmd())
+	}
+	fieldSlotFreed := false
+	if msg.key.Name != "activity" && m.fieldInFlight[msg.key] == msg.generation {
+		delete(m.fieldInFlight, msg.key)
+		requestKey := msg.requestKey
+		if requestKey == "" {
+			requestKey = m.fieldRequestForKey[msg.key]
+		}
+		delete(m.fieldRequestForKey, msg.key)
+		if requestKey == "" {
+			fieldSlotFreed = true
+		} else if remaining, ok := m.fieldRequestsInFlight[requestKey]; ok {
+			remaining--
+			if remaining <= 0 {
+				delete(m.fieldRequestsInFlight, requestKey)
+				fieldSlotFreed = true
+			} else {
+				m.fieldRequestsInFlight[requestKey] = remaining
+			}
+		}
+	}
+	if msg.key.Name == "activity" && m.activityInFlight[msg.key] == msg.generation {
+		delete(m.activityInFlight, msg.key)
+		cmds = append(cmds, m.startActivityFetches()...)
+		cmds = append(cmds, m.startFieldFetches()...)
+	}
+	f := m.fields[msg.key]
+	if f == nil || f.Generation != msg.generation {
+		if startNext && fieldSlotFreed {
+			cmds = append(cmds, m.startFieldFetches()...)
+		}
+		return cmds
+	}
+	if msg.err != nil {
+		issue := fetch.Classify(msg.err)
+		retryAt := fetch.RetryAt(issue, msg.attempt, msg.at)
+		f.Fail(msg.generation, issue, retryAt)
+		if !retryAt.IsZero() {
+			cmds = append(cmds, tea.Tick(max(time.Until(retryAt), time.Millisecond), func(time.Time) tea.Msg { return fieldRetryMsg{key: msg.key, generation: msg.generation} }))
+		}
+		m.log("error", "fetch-field", msg.key.String(), msg.attempt, 0, issue.Message)
+	} else {
+		f.Succeed(msg.generation, msg.value, msg.provenance)
+		m.cacheField(msg.key, msg.value, msg.provenance)
+		m.fieldAttempts[msg.key] = 0
+		switch value := msg.value.(type) {
+		case domain.ReviewSet:
+			if value.ViewerLogin != "" {
+				m.viewer = value.ViewerLogin
+			}
+		case domain.LoginSet:
+			if value.ViewerLogin != "" {
+				m.viewer = value.ViewerLogin
+			}
+		}
+		m.ensureSelection()
+	}
+	if startNext && fieldSlotFreed {
+		cmds = append(cmds, m.startFieldFetches()...)
+		cmds = append(cmds, m.startActivityFetches()...)
+	}
+	return cmds
+}
+
 func (m Model) spinner() string { return frames[m.frame%len(frames)] }
-func (m Model) sectionStatus(s section) (string, visualRole) {
+func (m Model) sectionStatus(s section, projected triage.Sections) (string, visualRole) {
 	switch s.field.Phase {
 	case domain.Queued:
 		return "◌ queued", roleQueued
@@ -676,7 +940,7 @@ func (m Model) sectionStatus(s section) (string, visualRole) {
 	case domain.Canceled:
 		return "○ canceled (r to retry)", roleCanceled
 	case domain.Ready:
-		summary := m.filterCountSummary(s)
+		summary := m.filterCountSummary(s, projected)
 		if s.field.Stale(m.opts.Clock.Now()) {
 			return "△ stale · " + summary + " · r to refresh", roleStale
 		}
@@ -689,9 +953,8 @@ func (m Model) sectionStatus(s section) (string, visualRole) {
 	}
 }
 
-func (m Model) filterCountSummary(s section) string {
+func (m Model) filterCountSummary(s section, projected triage.Sections) string {
 	filtered, pending := 0, 0
-	projected := m.projection()
 	for _, rows := range [][]triage.Row{projected.Review, projected.Active} {
 		for _, row := range rows {
 			if row.PR.ID.Repo != s.repo {

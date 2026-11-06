@@ -37,6 +37,27 @@ func TestSchedulerCoalescesSameKey(t *testing.T) {
 	}
 }
 
+func TestRateLimitedSchedulerPacesRequestsAcrossSources(t *testing.T) {
+	scheduler := NewRateLimitedScheduler(2, 20*time.Millisecond, time.Second)
+	started := make(chan time.Time, 2)
+	for _, source := range []string{"github", "github-activity"} {
+		source := source
+		go func() {
+			_, _ = scheduler.Do(context.Background(), source, source, func(context.Context) (any, error) {
+				started <- time.Now()
+				return nil, nil
+			})
+		}()
+	}
+	first, second := <-started, <-started
+	if second.Before(first) {
+		first, second = second, first
+	}
+	if gap := second.Sub(first); gap < 15*time.Millisecond {
+		t.Fatalf("request start gap=%s, want at least the configured pace", gap)
+	}
+}
+
 func TestRetryPolicy(t *testing.T) {
 	now := time.Now()
 	rate := &domain.FetchError{Kind: domain.ErrorRateLimit, RetryAt: now.Add(3 * time.Minute)}

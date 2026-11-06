@@ -2,6 +2,7 @@ package ui
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -15,11 +16,168 @@ import (
 	"github.com/fullsend-ai/fs-dash/internal/config"
 	"github.com/fullsend-ai/fs-dash/internal/diag"
 	"github.com/fullsend-ai/fs-dash/internal/domain"
+	"github.com/fullsend-ai/fs-dash/internal/enrichmentcache"
+	"github.com/fullsend-ai/fs-dash/internal/ports"
 	"github.com/fullsend-ai/fs-dash/internal/preferences"
 	"github.com/fullsend-ai/fs-dash/internal/reminder"
 	"github.com/fullsend-ai/fs-dash/internal/testutil"
 	"github.com/fullsend-ai/fs-dash/internal/triage"
 )
+
+type uiBatchEnricher struct {
+	keys  []domain.FieldKey
+	calls int
+}
+
+func (*uiBatchEnricher) FetchField(context.Context, domain.FieldKey) (any, domain.Provenance, error) {
+	return nil, domain.Provenance{}, errors.New("single-field fetch should not be used")
+}
+
+func (e *uiBatchEnricher) FetchFields(_ context.Context, keys []domain.FieldKey) map[domain.FieldKey]ports.FieldResult {
+	e.calls++
+	e.keys = append([]domain.FieldKey(nil), keys...)
+	results := make(map[domain.FieldKey]ports.FieldResult, len(keys))
+	for _, key := range keys {
+		var value any
+		switch key.Name {
+		case "checks":
+			value = domain.CheckSummary{Complete: true}
+		case "reviews":
+			value = domain.ReviewSet{Complete: true, ViewerLogin: "me"}
+		case "review_requests":
+			value = domain.LoginSet{Complete: true, ViewerLogin: "me"}
+		case "review_threads":
+			value = domain.ThreadSummary{Complete: true}
+		}
+		results[key] = ports.FieldResult{Value: value, Provenance: domain.Provenance{Source: "github", FreshUntil: time.Now().Add(time.Minute)}}
+	}
+	return results
+}
+
+func TestSummaryFieldsUseOneBatchRequestPerPRRevision(t *testing.T) {
+	enricher := &uiBatchEnricher{}
+	now := time.Now()
+	pr := testUIPr(7, now)
+	m := New(Options{Config: config.Default(), Repos: []string{"owner/repo"}, Enricher: enricher})
+	m.sections[0].field.Succeed(m.sections[0].field.Generation, []domain.PR{pr}, domain.Provenance{Source: "github", FreshUntil: now.Add(time.Hour)})
+	m.selected, m.hasSelection = pr.ID, true
+	m.fieldOffscreenWakeReady = true
+	item := pr.ID
+	for _, name := range []string{"checks", "reviews", "review_requests", "review_threads"} {
+		m.queueField(domain.FieldKey{Item: item, Name: name, Revision: "head"}, false)
+	}
+	cmds := m.startFieldFetches()
+	if len(cmds) != 1 || len(m.fieldInFlight) != 4 || len(m.fieldRequestsInFlight) != 1 {
+		t.Fatalf("combined request state: cmds=%d fields=%d requests=%d", len(cmds), len(m.fieldInFlight), len(m.fieldRequestsInFlight))
+	}
+	next, _ := m.Update(cmds[0]())
+	m = next.(Model)
+	if enricher.calls != 1 || len(enricher.keys) != 4 {
+		t.Fatalf("batch calls=%d fields=%+v", enricher.calls, enricher.keys)
+	}
+	for _, name := range []string{"checks", "reviews", "review_requests", "review_threads"} {
+		key := domain.FieldKey{Item: item, Name: name, Revision: "head"}
+		if field := m.fields[key]; field == nil || field.Phase != domain.Ready {
+			t.Errorf("%s field did not settle from the shared response: %+v", name, field)
+		}
+	}
+}
+
+func TestOffscreenEnrichmentIsPacedOneRequestAtATime(t *testing.T) {
+	enricher := testutil.Enricher{Fn: func(context.Context, domain.FieldKey) (any, domain.Provenance, error) {
+		return domain.CheckSummary{Complete: true}, domain.Provenance{Source: "github"}, nil
+	}}
+	m := New(Options{Config: config.Default(), Enricher: enricher})
+	first := domain.FieldKey{Item: testUIPr(1, time.Now()).ID, Name: "checks", Revision: "head-1"}
+	second := domain.FieldKey{Item: testUIPr(2, time.Now()).ID, Name: "checks", Revision: "head-2"}
+	m.queueField(first, false)
+	m.queueField(second, false)
+	if cmds := m.startFieldFetches(); len(cmds) != 1 || len(m.fieldInFlight) != 0 || !m.fieldOffscreenWakeRunning {
+		t.Fatalf("offscreen work was not delayed: cmds=%d in-flight=%d timer=%t", len(cmds), len(m.fieldInFlight), m.fieldOffscreenWakeRunning)
+	}
+	next, _ := m.Update(fieldOffscreenWakeMsg{generation: m.fieldOffscreenGeneration})
+	m = next.(Model)
+	if len(m.fieldInFlight) != 1 || m.fields[first].Phase != domain.Fetching || m.fields[second].Phase != domain.Queued {
+		t.Fatalf("paced offscreen state: in-flight=%d first=%s second=%s", len(m.fieldInFlight), m.fields[first].Phase, m.fields[second].Phase)
+	}
+	generation := m.fieldInFlight[first]
+	next, _ = m.Update(m.fetchField(first, generation, m.fieldAttempts[first])())
+	m = next.(Model)
+	if len(m.fieldInFlight) != 0 || !m.fieldOffscreenWakeRunning || m.fields[second].Phase != domain.Queued {
+		t.Fatalf("next offscreen item did not wait for a new pace interval: in-flight=%d timer=%t second=%s", len(m.fieldInFlight), m.fieldOffscreenWakeRunning, m.fields[second].Phase)
+	}
+
+	activity := domain.FieldKey{Item: first.Item, Name: "activity", Revision: first.Revision}
+	activityNext := domain.FieldKey{Item: second.Item, Name: "activity", Revision: second.Revision}
+	m.queueActivity(activity, false, false)
+	m.queueActivity(activityNext, false, false)
+	if cmds := m.startActivityFetches(); len(cmds) != 1 || len(m.activityInFlight) != 0 || !m.activityOffscreenWakeRunning {
+		t.Fatalf("offscreen activity was not delayed: cmds=%d in-flight=%d timer=%t", len(cmds), len(m.activityInFlight), m.activityOffscreenWakeRunning)
+	}
+	next, _ = m.Update(activityOffscreenWakeMsg{generation: m.activityOffscreenGeneration})
+	m = next.(Model)
+	if len(m.activityInFlight) != 1 || m.fields[activity].Phase != domain.Fetching || m.fields[activityNext].Phase != domain.Queued {
+		t.Fatalf("paced offscreen activity state: in-flight=%d first=%s second=%s", len(m.activityInFlight), m.fields[activity].Phase, m.fields[activityNext].Phase)
+	}
+}
+
+func TestExpiredCooldownCanRequeueCombinedSummarySibling(t *testing.T) {
+	now := time.Now()
+	m := New(Options{Config: config.Default(), Clock: &testClock{now: now}, Enricher: testutil.Enricher{Fn: func(context.Context, domain.FieldKey) (any, domain.Provenance, error) {
+		return nil, domain.Provenance{}, nil
+	}}})
+	key := domain.FieldKey{Item: testUIPr(1, now).ID, Name: "review_requests", Revision: "head-1"}
+	field := domain.NewField[any]()
+	generation := field.Queue()
+	field.Begin(generation)
+	field.Fail(generation, &domain.FetchError{Kind: domain.ErrorRateLimit, Message: "rate limited"}, now.Add(-time.Second))
+	m.fields[key] = &field
+	m.queueField(key, false)
+	if field.Phase != domain.Queued || !m.fieldQueued[key] {
+		t.Fatalf("expired cooldown remained blocking: phase=%s queued=%t retryAt=%s", field.Phase, m.fieldQueued[key], field.RetryAt)
+	}
+}
+
+func TestEnrichmentCacheRestoresFreshAndStaleValuesOnlyForMatchingRevision(t *testing.T) {
+	now := time.Date(2026, 11, 6, 17, 0, 0, 0, time.UTC)
+	store := enrichmentcache.NewFileStore(filepath.Join(t.TempDir(), "github-cache.json"))
+	item := domain.ItemID{Source: "github", Host: "github.com", Repo: "owner/repo", Number: 8}
+	checksKey := domain.FieldKey{Item: item, Name: "checks", Revision: "head-1"}
+	threadsKey := domain.FieldKey{Item: item, Name: "review_threads", Revision: "head-1"}
+	checksJSON, _ := json.Marshal(domain.CheckSummary{Total: 2, Complete: true})
+	threadsJSON, _ := json.Marshal(domain.ThreadSummary{Unresolved: 1, Complete: true})
+	if err := store.Save([]enrichmentcache.Entry{
+		{Key: checksKey, Value: checksJSON, Provenance: domain.Provenance{Source: "github", FetchedAt: now.Add(-time.Minute), FreshUntil: now.Add(time.Minute)}, LastAccess: now.Add(-time.Minute)},
+		{Key: threadsKey, Value: threadsJSON, Provenance: domain.Provenance{Source: "github", FetchedAt: now.Add(-5 * time.Minute), FreshUntil: now.Add(-4 * time.Minute)}, LastAccess: now.Add(-5 * time.Minute)},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	clock := &testClock{now: now}
+	m := New(Options{Config: config.Default(), Repos: []string{"owner/repo"}, Clock: clock, EnrichmentCache: store, Enricher: testutil.Enricher{Fn: func(context.Context, domain.FieldKey) (any, domain.Provenance, error) {
+		return nil, domain.Provenance{}, nil
+	}}})
+	if field := m.fields[checksKey]; field == nil || field.Phase != domain.Ready || field.Stale(now) {
+		t.Fatalf("fresh cache value was not restored: %+v", field)
+	}
+	if field := m.fields[threadsKey]; field == nil || field.Phase != domain.Ready || !field.Stale(now) {
+		t.Fatalf("expired cache value was not restored as stale: %+v", field)
+	}
+	pr := testUIPr(8, now)
+	pr.HeadSHA = "head-1"
+	next, _ := m.Update(listMsg{repo: "owner/repo", generation: m.sections[0].field.Generation, value: []domain.PR{pr}, viewer: "me", at: now})
+	m = next.(Model)
+	if field := m.fields[threadsKey]; field == nil || !field.Phase.Active() || !field.HasValue || !field.Stale(now) {
+		t.Fatalf("stale cache value was not retained during refresh: %+v", field)
+	}
+	if cell := m.threadsCell(pr); cell.text != "stale" {
+		t.Fatalf("stale cached value was not visible during refresh: %+v", cell)
+	}
+	newRevision := pr
+	newRevision.HeadSHA = "head-2"
+	if field := m.fieldFor(newRevision, "checks"); field != nil {
+		t.Fatalf("previous-revision cache was used for new head %q: %+v", newRevision.HeadSHA, field)
+	}
+}
 
 func TestFailedSectionSettlesWithoutBlockingOtherSection(t *testing.T) {
 	logs := diag.New(20)
@@ -227,6 +385,25 @@ func TestBackgroundPrefetchPromotesVisibleRowsAheadOfOffscreenRows(t *testing.T)
 	}
 	if lastVisible < 0 || firstOffscreen == len(m.fieldQueue) || lastVisible >= firstOffscreen {
 		t.Fatalf("visible summary queue is not ahead of off-screen work: visible through %d, off-screen starts %d", lastVisible, firstOffscreen)
+	}
+	m.startFieldFetches()
+	for key := range m.fieldInFlight {
+		if !visible[key.Item] {
+			t.Errorf("off-screen field started before visible work settled: %s", key)
+		}
+	}
+	if m.fieldOffscreenWakeRunning {
+		t.Fatal("off-screen field pacing began while visible work was still pending")
+	}
+	m.enqueueListActivity(prs)
+	m.startActivityFetches()
+	for key := range m.activityInFlight {
+		if !visible[key.Item] {
+			t.Errorf("off-screen activity started before visible work settled: %s", key)
+		}
+	}
+	if m.activityOffscreenWakeRunning {
+		t.Fatal("off-screen activity pacing began while visible work was still pending")
 	}
 }
 

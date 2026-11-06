@@ -17,24 +17,33 @@ type call struct {
 	err   error
 }
 
-// Scheduler bounds source concurrency and coalesces identical in-flight reads.
+// Scheduler bounds global concurrency, paces request starts, and coalesces identical in-flight reads.
 // Each Do performs one attempt; callers represent cooldown before scheduling a retry.
 type Scheduler struct {
-	mu        sync.Mutex
-	inflight  map[string]*call
-	limits    map[string]chan struct{}
-	perSource int
-	timeout   time.Duration
+	mu            sync.Mutex
+	inflight      map[string]*call
+	limit         chan struct{}
+	timeout       time.Duration
+	startInterval time.Duration
+	nextStart     time.Time
 }
 
-func NewScheduler(perSource int, timeout time.Duration) *Scheduler {
-	if perSource < 1 {
-		perSource = 2
+func NewScheduler(maxConcurrent int, timeout time.Duration) *Scheduler {
+	if maxConcurrent < 1 {
+		maxConcurrent = 2
 	}
 	if timeout <= 0 {
 		timeout = 20 * time.Second
 	}
-	return &Scheduler{inflight: map[string]*call{}, limits: map[string]chan struct{}{}, perSource: perSource, timeout: timeout}
+	return &Scheduler{inflight: map[string]*call{}, limit: make(chan struct{}, maxConcurrent), timeout: timeout}
+}
+
+func NewRateLimitedScheduler(maxConcurrent int, startInterval, timeout time.Duration) *Scheduler {
+	scheduler := NewScheduler(maxConcurrent, timeout)
+	if startInterval > 0 {
+		scheduler.startInterval = startInterval
+	}
+	return scheduler
 }
 
 func (s *Scheduler) Do(ctx context.Context, source, key string, fn func(context.Context) (any, error)) (any, error) {
@@ -49,11 +58,6 @@ func (s *Scheduler) Do(ctx context.Context, source, key string, fn func(context.
 			return nil, ctx.Err()
 		}
 	}
-	limit := s.limits[source]
-	if limit == nil {
-		limit = make(chan struct{}, s.perSource)
-		s.limits[source] = limit
-	}
 	pending := &call{done: make(chan struct{})}
 	s.inflight[fullKey] = pending
 	s.mu.Unlock()
@@ -67,10 +71,14 @@ func (s *Scheduler) Do(ctx context.Context, source, key string, fn func(context.
 
 	// Time spent waiting for a source slot is queue time, not request time.
 	select {
-	case limit <- struct{}{}:
-		defer func() { <-limit }()
+	case s.limit <- struct{}{}:
+		defer func() { <-s.limit }()
 	case <-ctx.Done():
 		pending.err = ctx.Err()
+		return nil, pending.err
+	}
+	if err := s.waitForStart(ctx); err != nil {
+		pending.err = err
 		return nil, pending.err
 	}
 	requestCtx, cancel := context.WithTimeout(ctx, s.timeout)
@@ -81,6 +89,33 @@ func (s *Scheduler) Do(ctx context.Context, source, key string, fn func(context.
 		pending.value = nil
 	}
 	return pending.value, pending.err
+}
+
+func (s *Scheduler) waitForStart(ctx context.Context) error {
+	s.mu.Lock()
+	if s.startInterval <= 0 {
+		s.mu.Unlock()
+		return nil
+	}
+	now := time.Now()
+	startAt := s.nextStart
+	if startAt.Before(now) {
+		startAt = now
+	}
+	s.nextStart = startAt.Add(s.startInterval)
+	delay := startAt.Sub(now)
+	s.mu.Unlock()
+	if delay <= 0 {
+		return nil
+	}
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
 }
 
 func Classify(err error) *domain.FetchError {

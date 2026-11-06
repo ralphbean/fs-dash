@@ -88,10 +88,10 @@ The system SHALL place PRs with current, source-backed remote Fullsend agent act
 
 #### Scenario: Activity prefetch after list load
 - **WHEN** a repository's open PR list loads
-- **THEN** the system starts fetching activity for its PRs in list order, with no more than five activity requests in flight across the application
+- **THEN** the system starts activity fetches for selected and visible PRs first, then processes offscreen PRs in a low-priority, paced queue, with no more than five activity requests in flight across the application
 
 #### Scenario: Selected PR is waiting in activity queue
-- **WHEN** the user selects a PR whose activity request is still queued
+- **WHEN** the user selects a PR whose activity request is queued
 - **THEN** that PR moves to the front of the waiting activity queue and starts as soon as an activity request slot is available, without issuing a duplicate request
 
 #### Scenario: Selection changes while detail enrichment is queued
@@ -99,8 +99,8 @@ The system SHALL place PRs with current, source-backed remote Fullsend agent act
 - **THEN** the system drops the previous PR's unstarted detail requests and keeps no more than two detail requests in flight
 
 #### Scenario: Activity query pending
-- **WHEN** activity detection has not completed for a PR
-- **THEN** the PR remains visible in the review section with an activity pending indicator
+- **WHEN** activity detection has not completed for a PR, including an offscreen PR waiting in the low-priority queue
+- **THEN** the PR remains visible in the review section with an activity pending indicator rather than being treated as inactive
 
 #### Scenario: Activity confirmed
 - **WHEN** current evidence indicates a remote Fullsend agent is working on the PR
@@ -114,15 +114,19 @@ The system SHALL derive bot approval from current effective reviews and SHALL di
 - **THEN** bot approval remains unknown and cannot lower the PR's priority as though no bot approved
 
 ### Requirement: Table triage summaries load in the background
-The system SHALL populate check, review, and unresolved review-thread summaries for PR rows asynchronously with bounded concurrency. The list SHALL render from the initial PR data without waiting for these summaries, and visible rows SHALL be prioritized in the background queue.
+The system SHALL populate check, review, and unresolved review-thread summaries for PR rows asynchronously with bounded concurrency. It SHALL obtain the check, review, review-request, and review-thread summaries for each PR from one combined query where supported. The list SHALL render from the initial PR data without waiting for these summaries, and selected and visible rows SHALL be prioritized ahead of offscreen rows, which SHALL be deferred to a paced, low-priority queue.
 
 #### Scenario: List appears before summaries are ready
 - **WHEN** the initial PR list loads while check, review, or thread summaries are unavailable
-- **THEN** the table renders immediately with pending indicators and summary fetches continue in the background
+- **THEN** the table renders immediately with pending indicators and combined summary fetches continue in the background
 
 #### Scenario: Visible row is waiting for summaries
 - **WHEN** a visible PR has queued summary fetches
-- **THEN** its fetches are prioritized ahead of off-screen PRs without duplicating requests
+- **THEN** its fetches are prioritized ahead of offscreen PRs without duplicating requests
+
+#### Scenario: Offscreen summaries are deferred
+- **WHEN** selected or visible PR summaries are still queued or in flight
+- **THEN** offscreen PR summaries remain queued for low-priority processing and are not treated as confirmed negative results
 
 #### Scenario: Summary fetch finishes or fails
 - **WHEN** a summary fetch completes or reaches a terminal error

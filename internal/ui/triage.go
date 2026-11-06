@@ -7,6 +7,7 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/fullsend-ai/fs-dash/internal/domain"
+	"github.com/fullsend-ai/fs-dash/internal/ports"
 	"github.com/fullsend-ai/fs-dash/internal/reminder"
 	"github.com/fullsend-ai/fs-dash/internal/triage"
 )
@@ -15,8 +16,80 @@ var triageFieldNames = []string{"reviews", "review_requests", "assignees", "chec
 
 const maxConcurrentActivityFetches = 5
 const maxConcurrentFieldFetches = 2
+const maxQueueItemsPerUpdate = 64
+const offscreenFieldPace = 500 * time.Millisecond
+const offscreenActivityPace = 750 * time.Millisecond
+const queueContinuationDelay = 5 * time.Millisecond
 
 var tableSummaryFieldNames = []string{"last_touched", "checks", "reviews", "review_threads", "assignees"}
+
+type prRevision struct {
+	item     domain.ItemID
+	revision string
+}
+
+type queueRef struct {
+	key        domain.FieldKey
+	generation uint64
+}
+
+type listPrefetchBatch struct {
+	repo       string
+	generation uint64
+	prs        []domain.PR
+}
+
+type interactivePRSet struct {
+	selected    domain.PR
+	hasSelected bool
+	visible     []domain.PR
+	identities  map[prRevision]struct{}
+	listed      map[prRevision]struct{}
+}
+
+func (set interactivePRSet) contains(key domain.FieldKey) bool {
+	_, ok := set.identities[prRevision{item: key.Item, revision: key.Revision}]
+	return ok
+}
+
+func (m Model) interactivePRs() interactivePRSet {
+	sections := m.projection()
+	set := interactivePRSet{identities: make(map[prRevision]struct{}), listed: make(map[prRevision]struct{})}
+	for _, section := range m.sections {
+		if !section.field.HasValue {
+			continue
+		}
+		for _, pr := range section.field.Value {
+			set.listed[prRevision{item: pr.ID, revision: pr.HeadSHA}] = struct{}{}
+		}
+	}
+	if selected, ok := selectedPRFromSections(sections, m.selected); ok {
+		set.selected = selected
+		set.hasSelected = true
+		set.identities[prRevision{item: selected.ID, revision: selected.HeadSHA}] = struct{}{}
+	}
+	set.visible = m.visibleRowsForPrefetchFrom(sections)
+	for _, pr := range set.visible {
+		set.identities[prRevision{item: pr.ID, revision: pr.HeadSHA}] = struct{}{}
+	}
+	return set
+}
+
+func selectedPRFromSections(sections triage.Sections, id domain.ItemID) (domain.PR, bool) {
+	row, ok := selectedRowFromSections(sections, id)
+	return row.PR, ok
+}
+
+func selectedRowFromSections(sections triage.Sections, id domain.ItemID) (triage.Row, bool) {
+	for _, rows := range [][]triage.Row{sections.Review, sections.Active, sections.Snoozed} {
+		for _, row := range rows {
+			if row.PR.ID == id {
+				return row, true
+			}
+		}
+	}
+	return triage.Row{}, false
+}
 
 func (m Model) showingSnoozed() bool {
 	return m.filter == triage.FilterSnoozed
@@ -227,7 +300,6 @@ func (m *Model) selectedFields(force bool) []tea.Cmd {
 	if !ok {
 		return append(m.startFieldFetches(), m.startActivityFetches()...)
 	}
-	m.discardQueuedFieldsExcept(pr.ID, pr.HeadSHA)
 	var selectedKeys []domain.FieldKey
 	for _, name := range triageFieldNames {
 		key := domain.FieldKey{Item: pr.ID, Name: name, Revision: pr.HeadSHA}
@@ -241,30 +313,12 @@ func (m *Model) selectedFields(force bool) []tea.Cmd {
 		m.queueField(key, force)
 		selectedKeys = append(selectedKeys, key)
 	}
-	for i := len(selectedKeys) - 1; i >= 0; i-- {
-		m.promoteField(selectedKeys[i])
+	for _, key := range selectedKeys {
+		m.promoteField(key)
 	}
-	m.prioritizeQueuedFields()
 	cmds := m.startFieldFetches()
 	cmds = append(cmds, m.startActivityFetches()...)
 	return cmds
-}
-
-func (m *Model) discardQueuedFieldsExcept(item domain.ItemID, revision string) {
-	kept := m.fieldQueue[:0]
-	for _, key := range m.fieldQueue {
-		keepSummary := m.isTableSummaryField(key.Name) && m.hasListedPR(key)
-		keepSelected := key.Item == item && key.Revision == revision
-		if keepSummary || keepSelected {
-			kept = append(kept, key)
-			continue
-		}
-		delete(m.fieldQueued, key)
-		if f := m.fields[key]; f != nil && f.Phase == domain.Queued {
-			f.Cancel(f.Generation)
-		}
-	}
-	m.fieldQueue = kept
 }
 
 func (m Model) isTableSummaryField(name string) bool {
@@ -276,52 +330,64 @@ func (m Model) isTableSummaryField(name string) bool {
 	return false
 }
 
-func (m Model) hasListedPR(key domain.FieldKey) bool {
-	for _, section := range m.sections {
-		if !section.field.HasValue {
-			continue
-		}
-		for _, pr := range section.field.Value {
-			if pr.ID == key.Item && pr.HeadSHA == key.Revision {
-				return true
-			}
-		}
-	}
-	return false
+func (m *Model) prioritizeQueuedFields() {
+	m.prioritizeQueuedFieldsFor(m.interactivePRs())
 }
 
-func (m *Model) prioritizeQueuedFields() {
-	if len(m.fieldQueue) < 2 {
+func (m *Model) prioritizeQueuedFieldsFor(interactive interactivePRSet) {
+	if len(m.fieldQueue)-m.fieldQueueHead < 2 {
 		return
 	}
-	priority := make([]domain.FieldKey, 0, len(m.fieldQueue))
+	type entry struct {
+		key        domain.FieldKey
+		generation uint64
+	}
+	pending := make([]entry, len(m.fieldQueue)-m.fieldQueueHead)
+	byKey := make(map[domain.FieldKey]entry, len(pending))
+	for i := range pending {
+		pending[i] = entry{key: m.fieldQueue[m.fieldQueueHead+i], generation: m.fieldQueueTokens[m.fieldQueueHead+i]}
+		byKey[pending[i].key] = pending[i]
+	}
+	priority := make([]entry, 0, len(pending))
 	seen := make(map[domain.FieldKey]bool, len(m.fieldQueue))
 	add := func(key domain.FieldKey) {
-		if m.fieldQueued[key] && !seen[key] {
-			priority = append(priority, key)
+		if !m.fieldQueued[key] || seen[key] {
+			return
+		}
+		if candidate, ok := byKey[key]; ok {
+			priority = append(priority, candidate)
 			seen[key] = true
 		}
 	}
-	if pr, ok := m.selectedPR(); ok {
+	if interactive.hasSelected {
 		for _, key := range m.fieldQueue {
-			if key.Item == pr.ID && key.Revision == pr.HeadSHA {
+			if key.Item == interactive.selected.ID && key.Revision == interactive.selected.HeadSHA {
 				add(key)
 			}
 		}
 	}
-	for _, pr := range m.visibleRowsForPrefetch() {
+	for _, pr := range interactive.visible {
 		for _, name := range tableSummaryFieldNames {
 			add(domain.FieldKey{Item: pr.ID, Name: name, Revision: pr.HeadSHA})
 		}
 	}
-	for _, key := range m.fieldQueue {
-		add(key)
+	for _, candidate := range pending {
+		if m.fieldQueued[candidate.key] && !seen[candidate.key] {
+			priority = append(priority, candidate)
+			seen[candidate.key] = true
+		}
 	}
-	m.fieldQueue = priority
+	for i, candidate := range priority {
+		m.fieldQueue[m.fieldQueueHead+i] = candidate.key
+		m.fieldQueueTokens[m.fieldQueueHead+i] = candidate.generation
+	}
 }
 
 func (m Model) visibleRowsForPrefetch() []domain.PR {
-	sections := m.projection()
+	return m.visibleRowsForPrefetchFrom(m.projection())
+}
+
+func (m Model) visibleRowsForPrefetchFrom(sections triage.Sections) []domain.PR {
 	type rowPosition struct {
 		pr   domain.PR
 		line int
@@ -366,7 +432,7 @@ func (m Model) visibleRowsForPrefetch() []domain.PR {
 		scope = strings.Join(m.opts.Repos, ", ")
 	}
 	lineCount := len(m.visual.header("fs-dash · Pull requests", scope, m.width)) + 1
-	selected, hasSelected := m.selectedPR()
+	selected, hasSelected := selectedPRFromSections(sections, m.selected)
 	if hasSelected {
 		var selectedRow triage.Row
 		if m.showingSnoozed() {
@@ -421,13 +487,15 @@ func (m *Model) promoteField(key domain.FieldKey) {
 	if !m.fieldQueued[key] {
 		return
 	}
-	for i, queued := range m.fieldQueue {
-		if queued == key {
-			copy(m.fieldQueue[1:i+1], m.fieldQueue[:i])
-			m.fieldQueue[0] = key
-			return
-		}
+	if m.fieldPriorityGeneration == nil {
+		m.fieldPriorityGeneration = map[domain.FieldKey]uint64{}
 	}
+	generation := m.fieldQueueGeneration[key]
+	if m.fieldPriorityGeneration[key] == generation {
+		return
+	}
+	m.fieldPriorityGeneration[key] = generation
+	m.fieldPriorityQueue = append(m.fieldPriorityQueue, queueRef{key: key, generation: generation})
 }
 
 func (m *Model) queueField(key domain.FieldKey, force bool) {
@@ -447,24 +515,74 @@ func (m *Model) queueField(key domain.FieldKey, force bool) {
 		m.fields[key] = f
 	} else if f.Phase.Active() {
 		return
-	} else if !force && (f.Phase == domain.Cooldown || (f.Phase == domain.Ready && !f.Stale(m.opts.Clock.Now()))) {
-		return
+	} else if !force {
+		now := m.opts.Clock.Now()
+		if (f.Phase == domain.Cooldown && now.Before(f.RetryAt)) || (f.Phase == domain.Ready && !f.Stale(now)) {
+			return
+		}
 	}
 	f.Queue()
 	if m.fieldQueued == nil {
 		m.fieldQueued = map[domain.FieldKey]bool{}
 	}
+	if m.fieldQueueGeneration == nil {
+		m.fieldQueueGeneration = map[domain.FieldKey]uint64{}
+	}
+	if m.fieldQueueHead == len(m.fieldQueue) {
+		m.fieldQueue = m.fieldQueue[:0]
+		m.fieldQueueTokens = m.fieldQueueTokens[:0]
+		m.fieldQueueHead = 0
+	}
+	generation := m.fieldQueueGeneration[key] + 1
+	m.fieldQueueGeneration[key] = generation
 	m.fieldQueued[key] = true
 	m.fieldQueue = append(m.fieldQueue, key)
+	m.fieldQueueTokens = append(m.fieldQueueTokens, generation)
 }
 
 func (m *Model) startFieldFetches() []tea.Cmd {
 	var cmds []tea.Cmd
-	for len(m.fieldInFlight) < maxConcurrentFieldFetches && len(m.fieldQueue) > 0 {
-		key := m.fieldQueue[0]
-		m.fieldQueue = m.fieldQueue[1:]
-		delete(m.fieldQueued, key)
-		f := m.fields[key]
+	if !m.hasPendingFieldQueue() || len(m.fieldRequestsInFlight) >= maxConcurrentFieldFetches {
+		return nil
+	}
+	interactive := m.interactivePRs()
+	m.promoteInteractiveFields(interactive)
+	budget := maxQueueItemsPerUpdate
+	blocked := false
+	for len(m.fieldRequestsInFlight) < maxConcurrentFieldFetches && budget > 0 {
+		ref, priority, ok := m.nextFieldCandidate(interactive, &budget)
+		if !ok {
+			break
+		}
+		background := !interactive.contains(ref.key)
+		if background {
+			if m.hasInteractiveFieldWork(interactive) || m.hasInteractiveActivityWork(interactive) || m.hasOffscreenEnrichmentInFlight(interactive) {
+				blocked = true
+				break
+			}
+			if !m.fieldOffscreenWakeReady {
+				if !m.fieldOffscreenWakeRunning {
+					m.fieldOffscreenWakeRunning = true
+					m.fieldOffscreenGeneration++
+					generation := m.fieldOffscreenGeneration
+					cmds = append(cmds, tea.Tick(offscreenFieldPace, func(time.Time) tea.Msg { return fieldOffscreenWakeMsg{generation: generation} }))
+				}
+				blocked = true
+				break
+			}
+			m.fieldOffscreenWakeReady = false
+		}
+		m.consumeFieldCandidate(ref, priority)
+		if _, ok := m.opts.Enricher.(ports.BatchEnricher); ok && combinedSummaryField(ref.key.Name) {
+			if cmd := m.startCombinedSummary(ref.key); cmd != nil {
+				cmds = append(cmds, cmd)
+			}
+			if background {
+				break
+			}
+			continue
+		}
+		f := m.fields[ref.key]
 		if f == nil || f.Phase != domain.Queued {
 			continue
 		}
@@ -472,38 +590,277 @@ func (m *Model) startFieldFetches() []tea.Cmd {
 		if !f.Begin(generation) {
 			continue
 		}
-		m.fieldInFlight[key] = generation
+		m.fieldInFlight[ref.key] = generation
+		requestKey := ref.key.String()
+		m.fieldRequestForKey[ref.key] = requestKey
+		m.fieldRequestsInFlight[requestKey] = 1
+		attempt := m.fieldAttempts[ref.key] + 1
+		if attempt < 1 {
+			attempt = 1
+		}
+		m.fieldAttempts[ref.key] = attempt
+		cmds = append(cmds, m.fetchField(ref.key, generation, attempt))
+		if background {
+			break
+		}
+	}
+	if budget == 0 && !blocked && len(m.fieldRequestsInFlight) < maxConcurrentFieldFetches && m.hasPendingFieldQueue() {
+		if !m.fieldQueueChunkRunning {
+			m.fieldQueueChunkRunning = true
+			cmds = append(cmds, tea.Tick(queueContinuationDelay, func(time.Time) tea.Msg { return fieldQueueChunkMsg{} }))
+		}
+	}
+	return cmds
+}
+
+func (m Model) hasPendingFieldQueue() bool {
+	return m.fieldPriorityHead < len(m.fieldPriorityQueue) || m.fieldQueueHead < len(m.fieldQueue)
+}
+
+func (m *Model) promoteInteractiveFields(interactive interactivePRSet) {
+	if interactive.hasSelected {
+		for _, name := range triageFieldNames {
+			if name != "activity" {
+				m.promoteField(domain.FieldKey{Item: interactive.selected.ID, Name: name, Revision: interactive.selected.HeadSHA})
+			}
+		}
+	}
+	for _, pr := range interactive.visible {
+		for _, name := range tableSummaryFieldNames {
+			m.promoteField(domain.FieldKey{Item: pr.ID, Name: name, Revision: pr.HeadSHA})
+		}
+	}
+}
+
+func (m *Model) nextFieldCandidate(interactive interactivePRSet, budget *int) (queueRef, bool, bool) {
+	for m.fieldPriorityHead < len(m.fieldPriorityQueue) && *budget > 0 {
+		ref := m.fieldPriorityQueue[m.fieldPriorityHead]
+		if !m.fieldQueued[ref.key] || m.fieldQueueGeneration[ref.key] != ref.generation {
+			m.fieldPriorityHead++
+			*budget = *budget - 1
+			if m.fieldPriorityGeneration[ref.key] == ref.generation {
+				delete(m.fieldPriorityGeneration, ref.key)
+			}
+			continue
+		}
+		if !interactive.contains(ref.key) {
+			m.fieldPriorityHead++
+			*budget = *budget - 1
+			if m.fieldPriorityGeneration[ref.key] == ref.generation {
+				delete(m.fieldPriorityGeneration, ref.key)
+			}
+			continue
+		}
+		*budget = *budget - 1
+		return ref, true, true
+	}
+	for m.fieldQueueHead < len(m.fieldQueue) && *budget > 0 {
+		ref := queueRef{key: m.fieldQueue[m.fieldQueueHead], generation: m.fieldQueueTokens[m.fieldQueueHead]}
+		if !m.fieldQueued[ref.key] || m.fieldQueueGeneration[ref.key] != ref.generation {
+			m.fieldQueueHead++
+			*budget = *budget - 1
+			continue
+		}
+		if !m.eligibleField(ref.key, interactive) {
+			m.cancelQueuedField(ref)
+			m.fieldQueueHead++
+			*budget = *budget - 1
+			continue
+		}
+		*budget = *budget - 1
+		return ref, false, true
+	}
+	if m.fieldQueueHead == len(m.fieldQueue) {
+		m.fieldQueue = m.fieldQueue[:0]
+		m.fieldQueueTokens = m.fieldQueueTokens[:0]
+		m.fieldQueueHead = 0
+	}
+	if m.fieldPriorityHead == len(m.fieldPriorityQueue) {
+		m.fieldPriorityQueue = m.fieldPriorityQueue[:0]
+		m.fieldPriorityHead = 0
+	}
+	return queueRef{}, false, false
+}
+
+func (m Model) eligibleField(key domain.FieldKey, interactive interactivePRSet) bool {
+	if interactive.contains(key) {
+		return true
+	}
+	if !m.isTableSummaryField(key.Name) {
+		return false
+	}
+	_, ok := interactive.listed[prRevision{item: key.Item, revision: key.Revision}]
+	return ok
+}
+
+func (m *Model) cancelQueuedField(ref queueRef) {
+	if m.fieldQueueGeneration[ref.key] != ref.generation {
+		return
+	}
+	delete(m.fieldQueued, ref.key)
+	if m.fieldPriorityGeneration[ref.key] == ref.generation {
+		delete(m.fieldPriorityGeneration, ref.key)
+	}
+	if field := m.fields[ref.key]; field != nil && field.Phase == domain.Queued {
+		field.Cancel(field.Generation)
+	}
+}
+
+func (m *Model) consumeFieldCandidate(ref queueRef, priority bool) {
+	if priority {
+		m.fieldPriorityHead++
+		if m.fieldPriorityGeneration[ref.key] == ref.generation {
+			delete(m.fieldPriorityGeneration, ref.key)
+		}
+	} else {
+		m.fieldQueueHead++
+	}
+	delete(m.fieldQueued, ref.key)
+}
+
+func (m Model) hasInteractiveFieldWork(interactive interactivePRSet) bool {
+	if interactive.hasSelected {
+		for _, name := range triageFieldNames {
+			key := domain.FieldKey{Item: interactive.selected.ID, Name: name, Revision: interactive.selected.HeadSHA}
+			if name != "activity" && m.fieldQueued[key] {
+				return true
+			}
+		}
+	}
+	for _, pr := range interactive.visible {
+		for _, name := range tableSummaryFieldNames {
+			if m.fieldQueued[domain.FieldKey{Item: pr.ID, Name: name, Revision: pr.HeadSHA}] {
+				return true
+			}
+		}
+	}
+	for key := range m.fieldInFlight {
+		if interactive.contains(key) {
+			return true
+		}
+	}
+	return false
+}
+
+func (m Model) hasOffscreenEnrichmentInFlight(interactive interactivePRSet) bool {
+	for key := range m.fieldInFlight {
+		if !interactive.contains(key) {
+			return true
+		}
+	}
+	for key := range m.activityInFlight {
+		if !interactive.contains(key) {
+			return true
+		}
+	}
+	return false
+}
+
+func combinedSummaryField(name string) bool {
+	switch name {
+	case "checks", "reviews", "review_requests", "review_threads":
+		return true
+	default:
+		return false
+	}
+}
+
+func (m *Model) startCombinedSummary(first domain.FieldKey) tea.Cmd {
+	requestKey := "summary:" + first.Item.String() + ":" + first.Revision
+	var keys []domain.FieldKey
+	var generations []uint64
+	var attempts []int
+	for _, name := range []string{"checks", "reviews", "review_requests", "review_threads"} {
+		key := domain.FieldKey{Item: first.Item, Name: name, Revision: first.Revision}
+		if key != first {
+			m.queueField(key, false)
+		}
+		field := m.fields[key]
+		if field == nil || field.Phase != domain.Queued {
+			continue
+		}
+		generation := field.Generation
+		if !field.Begin(generation) {
+			continue
+		}
+		delete(m.fieldQueued, key)
+		if m.fieldPriorityGeneration[key] == m.fieldQueueGeneration[key] {
+			delete(m.fieldPriorityGeneration, key)
+		}
 		attempt := m.fieldAttempts[key] + 1
 		if attempt < 1 {
 			attempt = 1
 		}
 		m.fieldAttempts[key] = attempt
-		cmds = append(cmds, m.fetchField(key, generation, attempt))
+		m.fieldInFlight[key] = generation
+		m.fieldRequestForKey[key] = requestKey
+		keys = append(keys, key)
+		generations = append(generations, generation)
+		attempts = append(attempts, attempt)
 	}
-	return cmds
+	if len(keys) == 0 {
+		return nil
+	}
+	m.fieldRequestsInFlight[requestKey] = len(keys)
+	return m.fetchFields(keys, generations, attempts, requestKey)
 }
 
-func (m *Model) enqueueListActivity(prs []domain.PR) {
-	if m.opts.Enricher == nil {
-		return
+func (m *Model) enqueueListPrefetch(repo string, generation uint64, prs []domain.PR) tea.Cmd {
+	if m.opts.Enricher == nil || len(prs) == 0 {
+		return nil
 	}
-	for _, pr := range prs {
-		m.queueActivity(domain.FieldKey{Item: pr.ID, Name: "activity", Revision: pr.HeadSHA}, false, false)
+	if m.prefetchBatchHead == len(m.prefetchBatches) {
+		m.prefetchBatches = m.prefetchBatches[:0]
+		m.prefetchBatchHead = 0
+		m.prefetchPRIndex = 0
 	}
+	m.prefetchBatches = append(m.prefetchBatches, listPrefetchBatch{repo: repo, generation: generation, prs: prs})
+	if m.prefetchChunkRunning {
+		return nil
+	}
+	return m.processListPrefetchChunk()
 }
 
-func (m *Model) enqueueListSummaries(prs []domain.PR) {
-	if m.opts.Enricher == nil {
-		return
-	}
-	for _, pr := range prs {
+func (m *Model) processListPrefetchChunk() tea.Cmd {
+	processed := 0
+	for m.prefetchBatchHead < len(m.prefetchBatches) && processed < maxQueueItemsPerUpdate {
+		batch := m.prefetchBatches[m.prefetchBatchHead]
+		section := m.section(batch.repo)
+		if section == nil || section.field.Generation != batch.generation || section.field.Phase != domain.Ready {
+			m.prefetchBatchHead++
+			m.prefetchPRIndex = 0
+			processed++
+			continue
+		}
+		if m.prefetchPRIndex >= len(batch.prs) {
+			m.prefetchBatchHead++
+			m.prefetchPRIndex = 0
+			continue
+		}
+		pr := batch.prs[m.prefetchPRIndex]
+		m.prefetchPRIndex++
+		processed++
 		for _, name := range []string{"last_touched", "checks", "reviews", "review_threads"} {
 			m.queueField(domain.FieldKey{Item: pr.ID, Name: name, Revision: pr.HeadSHA}, false)
 		}
 		if !pr.Assignees.Complete {
 			m.queueField(domain.FieldKey{Item: pr.ID, Name: "assignees", Revision: pr.HeadSHA}, false)
 		}
+		m.queueActivity(domain.FieldKey{Item: pr.ID, Name: "activity", Revision: pr.HeadSHA}, false, false)
+		if m.prefetchPRIndex == len(batch.prs) {
+			m.prefetchBatchHead++
+			m.prefetchPRIndex = 0
+		}
 	}
+	if m.prefetchBatchHead == len(m.prefetchBatches) {
+		m.prefetchBatches = m.prefetchBatches[:0]
+		m.prefetchBatchHead = 0
+		m.prefetchPRIndex = 0
+		m.prefetchChunkRunning = false
+		return nil
+	}
+	m.prefetchChunkRunning = true
+	return tea.Tick(queueContinuationDelay, func(time.Time) tea.Msg { return listPrefetchChunkMsg{} })
 }
 
 func (m *Model) queueActivity(key domain.FieldKey, force, prioritize bool) {
@@ -526,8 +883,11 @@ func (m *Model) queueActivity(key domain.FieldKey, force, prioritize bool) {
 		m.fields[key] = f
 	} else if f.Phase.Active() {
 		return
-	} else if !force && (f.Phase == domain.Cooldown || (f.Phase == domain.Ready && !f.Stale(m.opts.Clock.Now()))) {
-		return
+	} else if !force {
+		now := m.opts.Clock.Now()
+		if (f.Phase == domain.Cooldown && now.Before(f.RetryAt)) || (f.Phase == domain.Ready && !f.Stale(now)) {
+			return
+		}
 	}
 	f.Queue()
 	attempt := m.fieldAttempts[key] + 1
@@ -538,8 +898,19 @@ func (m *Model) queueActivity(key domain.FieldKey, force, prioritize bool) {
 	if m.activityQueued == nil {
 		m.activityQueued = map[domain.FieldKey]bool{}
 	}
+	if m.activityQueueGeneration == nil {
+		m.activityQueueGeneration = map[domain.FieldKey]uint64{}
+	}
+	if m.activityQueueHead == len(m.activityQueue) {
+		m.activityQueue = m.activityQueue[:0]
+		m.activityQueueTokens = m.activityQueueTokens[:0]
+		m.activityQueueHead = 0
+	}
+	generation := m.activityQueueGeneration[key] + 1
+	m.activityQueueGeneration[key] = generation
 	m.activityQueued[key] = true
 	m.activityQueue = append(m.activityQueue, key)
+	m.activityQueueTokens = append(m.activityQueueTokens, generation)
 	if prioritize {
 		m.promoteActivity(key)
 	}
@@ -549,22 +920,51 @@ func (m *Model) promoteActivity(key domain.FieldKey) {
 	if !m.activityQueued[key] {
 		return
 	}
-	for i, queued := range m.activityQueue {
-		if queued == key {
-			copy(m.activityQueue[1:i+1], m.activityQueue[:i])
-			m.activityQueue[0] = key
-			return
-		}
+	if m.activityPriorityGeneration == nil {
+		m.activityPriorityGeneration = map[domain.FieldKey]uint64{}
 	}
+	generation := m.activityQueueGeneration[key]
+	if m.activityPriorityGeneration[key] == generation {
+		return
+	}
+	m.activityPriorityGeneration[key] = generation
+	m.activityPriorityQueue = append(m.activityPriorityQueue, queueRef{key: key, generation: generation})
 }
 
 func (m *Model) startActivityFetches() []tea.Cmd {
 	var cmds []tea.Cmd
-	for len(m.activityInFlight) < maxConcurrentActivityFetches && len(m.activityQueue) > 0 {
-		key := m.activityQueue[0]
-		m.activityQueue = m.activityQueue[1:]
-		delete(m.activityQueued, key)
-		f := m.fields[key]
+	if !m.hasPendingActivityQueue() || len(m.activityInFlight) >= maxConcurrentActivityFetches {
+		return nil
+	}
+	interactive := m.interactivePRs()
+	m.promoteInteractiveActivity(interactive)
+	budget := maxQueueItemsPerUpdate
+	blocked := false
+	for len(m.activityInFlight) < maxConcurrentActivityFetches && budget > 0 {
+		ref, priority, ok := m.nextActivityCandidate(interactive, &budget)
+		if !ok {
+			break
+		}
+		background := !interactive.contains(ref.key)
+		if background {
+			if m.hasInteractiveFieldWork(interactive) || m.hasInteractiveActivityWork(interactive) || m.hasOffscreenEnrichmentInFlight(interactive) {
+				blocked = true
+				break
+			}
+			if !m.activityOffscreenWakeReady {
+				if !m.activityOffscreenWakeRunning {
+					m.activityOffscreenWakeRunning = true
+					m.activityOffscreenGeneration++
+					generation := m.activityOffscreenGeneration
+					cmds = append(cmds, tea.Tick(offscreenActivityPace, func(time.Time) tea.Msg { return activityOffscreenWakeMsg{generation: generation} }))
+				}
+				blocked = true
+				break
+			}
+			m.activityOffscreenWakeReady = false
+		}
+		m.consumeActivityCandidate(ref, priority)
+		f := m.fields[ref.key]
 		if f == nil || f.Phase != domain.Queued {
 			continue
 		}
@@ -572,15 +972,129 @@ func (m *Model) startActivityFetches() []tea.Cmd {
 		if !f.Begin(generation) {
 			continue
 		}
-		m.activityInFlight[key] = generation
-		attempt := m.fieldAttempts[key]
+		m.activityInFlight[ref.key] = generation
+		attempt := m.fieldAttempts[ref.key]
 		if attempt < 1 {
 			attempt = 1
-			m.fieldAttempts[key] = attempt
+			m.fieldAttempts[ref.key] = attempt
 		}
-		cmds = append(cmds, m.fetchField(key, generation, attempt))
+		cmds = append(cmds, m.fetchField(ref.key, generation, attempt))
+		if background {
+			break
+		}
+	}
+	if budget == 0 && !blocked && len(m.activityInFlight) < maxConcurrentActivityFetches && m.hasPendingActivityQueue() {
+		if !m.activityQueueChunkRunning {
+			m.activityQueueChunkRunning = true
+			cmds = append(cmds, tea.Tick(queueContinuationDelay, func(time.Time) tea.Msg { return activityQueueChunkMsg{} }))
+		}
 	}
 	return cmds
+}
+
+func (m Model) hasPendingActivityQueue() bool {
+	return m.activityPriorityHead < len(m.activityPriorityQueue) || m.activityQueueHead < len(m.activityQueue)
+}
+
+func (m *Model) promoteInteractiveActivity(interactive interactivePRSet) {
+	if interactive.hasSelected {
+		m.promoteActivity(domain.FieldKey{Item: interactive.selected.ID, Name: "activity", Revision: interactive.selected.HeadSHA})
+	}
+	for _, pr := range interactive.visible {
+		m.promoteActivity(domain.FieldKey{Item: pr.ID, Name: "activity", Revision: pr.HeadSHA})
+	}
+}
+
+func (m *Model) nextActivityCandidate(interactive interactivePRSet, budget *int) (queueRef, bool, bool) {
+	for m.activityPriorityHead < len(m.activityPriorityQueue) && *budget > 0 {
+		ref := m.activityPriorityQueue[m.activityPriorityHead]
+		if !m.activityQueued[ref.key] || m.activityQueueGeneration[ref.key] != ref.generation || !interactive.contains(ref.key) {
+			m.activityPriorityHead++
+			*budget = *budget - 1
+			if m.activityPriorityGeneration[ref.key] == ref.generation {
+				delete(m.activityPriorityGeneration, ref.key)
+			}
+			continue
+		}
+		*budget = *budget - 1
+		return ref, true, true
+	}
+	for m.activityQueueHead < len(m.activityQueue) && *budget > 0 {
+		ref := queueRef{key: m.activityQueue[m.activityQueueHead], generation: m.activityQueueTokens[m.activityQueueHead]}
+		if !m.activityQueued[ref.key] || m.activityQueueGeneration[ref.key] != ref.generation {
+			m.activityQueueHead++
+			*budget = *budget - 1
+			continue
+		}
+		if !m.eligibleActivity(ref.key, interactive) {
+			m.cancelQueuedActivity(ref)
+			m.activityQueueHead++
+			*budget = *budget - 1
+			continue
+		}
+		*budget = *budget - 1
+		return ref, false, true
+	}
+	if m.activityQueueHead == len(m.activityQueue) {
+		m.activityQueue = m.activityQueue[:0]
+		m.activityQueueTokens = m.activityQueueTokens[:0]
+		m.activityQueueHead = 0
+	}
+	if m.activityPriorityHead == len(m.activityPriorityQueue) {
+		m.activityPriorityQueue = m.activityPriorityQueue[:0]
+		m.activityPriorityHead = 0
+	}
+	return queueRef{}, false, false
+}
+
+func (m Model) eligibleActivity(key domain.FieldKey, interactive interactivePRSet) bool {
+	if interactive.contains(key) {
+		return true
+	}
+	_, ok := interactive.listed[prRevision{item: key.Item, revision: key.Revision}]
+	return ok
+}
+
+func (m *Model) cancelQueuedActivity(ref queueRef) {
+	if m.activityQueueGeneration[ref.key] != ref.generation {
+		return
+	}
+	delete(m.activityQueued, ref.key)
+	if m.activityPriorityGeneration[ref.key] == ref.generation {
+		delete(m.activityPriorityGeneration, ref.key)
+	}
+	if field := m.fields[ref.key]; field != nil && field.Phase == domain.Queued {
+		field.Cancel(field.Generation)
+	}
+}
+
+func (m *Model) consumeActivityCandidate(ref queueRef, priority bool) {
+	if priority {
+		m.activityPriorityHead++
+		if m.activityPriorityGeneration[ref.key] == ref.generation {
+			delete(m.activityPriorityGeneration, ref.key)
+		}
+	} else {
+		m.activityQueueHead++
+	}
+	delete(m.activityQueued, ref.key)
+}
+
+func (m Model) hasInteractiveActivityWork(interactive interactivePRSet) bool {
+	if interactive.hasSelected && m.activityQueued[domain.FieldKey{Item: interactive.selected.ID, Name: "activity", Revision: interactive.selected.HeadSHA}] {
+		return true
+	}
+	for _, pr := range interactive.visible {
+		if m.activityQueued[domain.FieldKey{Item: pr.ID, Name: "activity", Revision: pr.HeadSHA}] {
+			return true
+		}
+	}
+	for key := range m.activityInFlight {
+		if interactive.contains(key) {
+			return true
+		}
+	}
+	return false
 }
 
 func (m *Model) scheduleWake() tea.Cmd {
@@ -612,6 +1126,20 @@ func (m *Model) scheduleWake() tea.Cmd {
 	return tea.Tick(delay, func(time.Time) tea.Msg { return wakeMsg{generation: generation} })
 }
 
+type listContentKind uint8
+
+const (
+	listContentText listContentKind = iota
+	listContentTableHeader
+	listContentPR
+)
+
+type listContentLine struct {
+	kind listContentKind
+	text string
+	row  triage.Row
+}
+
 func (m Model) listView() string {
 	sections := m.projection()
 	scope := "no repository configured"
@@ -620,68 +1148,62 @@ func (m Model) listView() string {
 	}
 	lines := m.visual.header("fs-dash · Pull requests", scope, m.width)
 	lines = append(lines, m.filterTabs())
-	tableRows := make([]triage.Row, 0, len(sections.Review)+len(sections.Active)+len(sections.Snoozed))
+	rowCount := len(sections.Review) + len(sections.Active)
 	if m.showingSnoozed() {
-		tableRows = append(tableRows, sections.Snoozed...)
-	} else {
-		tableRows = append(tableRows, sections.Review...)
-		tableRows = append(tableRows, sections.Active...)
+		rowCount = len(sections.Snoozed)
 	}
-	columns, widths := m.tableColumns(tableRows, m.showingSnoozed())
-	content := make([]string, 0, len(tableRows)+len(m.sections)+8)
-	rows := make(map[domain.ItemID]triage.Row)
+	content := make([]listContentLine, 0, rowCount+len(m.sections)+8)
+	appendText := func(text string) { content = append(content, listContentLine{kind: listContentText, text: text}) }
+	appendHeader := func() { content = append(content, listContentLine{kind: listContentTableHeader}) }
+	appendPR := func(row triage.Row) { content = append(content, listContentLine{kind: listContentPR, row: row}) }
 	selectedLine := -1
 	if m.showingSnoozed() {
-		content = append(content, m.renderTableHeader(columns, widths))
+		appendHeader()
 		for _, row := range sections.Snoozed {
-			rows[row.PR.ID] = row
 			if row.PR.ID == m.selected {
 				selectedLine = len(content)
 			}
-			content = append(content, m.renderTableRow(row, columns, widths, m.hasSelection && row.PR.ID == m.selected))
+			appendPR(row)
 		}
 	} else {
-		content = append(content, m.visual.paint(roleAccent, "REVIEW"))
-		if summaries := m.repositorySummaryLine(); summaries != "" {
-			content = append(content, summaries)
+		appendText(m.visual.paint(roleAccent, "REVIEW"))
+		if summaries := m.repositorySummaryLine(sections); summaries != "" {
+			appendText(summaries)
 		}
-		content = append(content, m.renderTableHeader(columns, widths))
+		appendHeader()
 		for _, row := range sections.Review {
-			rows[row.PR.ID] = row
 			if row.PR.ID == m.selected {
 				selectedLine = len(content)
 			}
-			content = append(content, m.renderTableRow(row, columns, widths, m.hasSelection && row.PR.ID == m.selected))
+			appendPR(row)
 		}
 		if len(sections.Active) > 0 {
-			content = append(content, m.visual.paint(roleAccent, "ACTIVE FULLSEND AGENTS"))
-			content = append(content, m.renderTableHeader(columns, widths))
+			appendText(m.visual.paint(roleAccent, "ACTIVE FULLSEND AGENTS"))
+			appendHeader()
 			for _, row := range sections.Active {
-				rows[row.PR.ID] = row
 				if row.PR.ID == m.selected {
 					selectedLine = len(content)
 				}
-				content = append(content, m.renderTableRow(row, columns, widths, m.hasSelection && row.PR.ID == m.selected))
+				appendPR(row)
 			}
 		}
 	}
-	if len(rows) == 0 {
+	if rowCount == 0 {
 		if m.showingSnoozed() {
-			content = append(content, m.visual.paint(roleMuted, "No PRs are currently snoozed."))
+			appendText(m.visual.paint(roleMuted, "No PRs are currently snoozed."))
 		} else {
-			content = append(content, m.visual.paint(roleMuted, "No PRs match this filter. Pending filter data remains visible when its result is unknown."))
+			appendText(m.visual.paint(roleMuted, "No PRs match this filter. Pending filter data remains visible when its result is unknown."))
 		}
 	}
 	if len(m.opts.Repos) == 0 {
-		content = append(content, m.visual.paint(roleMuted, "No GitHub repository found. Add repositories = [\"owner/name\"] to config.toml or run from a GitHub checkout."))
+		appendText(m.visual.paint(roleMuted, "No GitHub repository found. Add repositories = [\"owner/name\"] to config.toml or run from a GitHub checkout."))
 	}
-	selected, hasSelected := m.selectedPR()
+	selectedRow, hasSelected := selectedRowFromSections(sections, m.selected)
 	var context []string
 	if hasSelected {
-		context = m.selectedContext(selected, rows[selected.ID])
+		context = m.selectedContext(selectedRow.PR, selectedRow)
 	}
-	statusLines := 0
-	statusLines++ // quota status is always present, including the unknown state
+	statusLines := 1 // Quota status is always present, including the unknown state.
 	if m.status != "" {
 		statusLines++
 	}
@@ -697,7 +1219,19 @@ func (m Model) listView() string {
 		}
 	}
 	end := min(len(content), start+available)
-	lines = append(lines, m.visual.panel("PR attention", content[start:end], m.width)...)
+	columns, widths := m.tableColumns(visibleContentRows(content[start:end]), m.showingSnoozed())
+	visibleContent := make([]string, 0, end-start)
+	for _, line := range content[start:end] {
+		switch line.kind {
+		case listContentTableHeader:
+			visibleContent = append(visibleContent, m.renderTableHeader(columns, widths))
+		case listContentPR:
+			visibleContent = append(visibleContent, m.renderTableRow(line.row, columns, widths, m.hasSelection && line.row.PR.ID == m.selected))
+		default:
+			visibleContent = append(visibleContent, line.text)
+		}
+	}
+	lines = append(lines, m.visual.panel("PR attention", visibleContent, m.width)...)
 	if hasSelected {
 		lines = append(lines, context...)
 	}
@@ -716,6 +1250,16 @@ func (m Model) listView() string {
 	return strings.Join(lines, "\n") + "\n"
 }
 
+func visibleContentRows(lines []listContentLine) []triage.Row {
+	rows := make([]triage.Row, 0, len(lines))
+	for _, line := range lines {
+		if line.kind == listContentPR {
+			rows = append(rows, line.row)
+		}
+	}
+	return rows
+}
+
 func (m Model) View() string {
 	if m.console {
 		return m.consoleView()
@@ -732,10 +1276,10 @@ func (m Model) View() string {
 	return m.listView()
 }
 
-func (m Model) repositorySummaryLine() string {
+func (m Model) repositorySummaryLine(projected triage.Sections) string {
 	var parts []string
 	for _, section := range m.sections {
-		state, role := m.sectionStatus(section)
+		state, role := m.sectionStatus(section, projected)
 		parts = append(parts, m.visual.paint(roleMuted, section.repo+" · ")+m.visual.paint(role, state))
 	}
 	separator := m.visual.paint(roleMuted, "  │  ")

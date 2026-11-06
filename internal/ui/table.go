@@ -290,6 +290,9 @@ func (m Model) checksCell(pr domain.PR) tableCell {
 		return stateCell(cellPending, "pending", roleUnrequested)
 	}
 	if f.Phase.Active() {
+		if f.HasValue && f.Stale(m.opts.Clock.Now()) {
+			return stateCell(cellStale, "stale", roleStale)
+		}
 		return loadingCell(m.loadingSummary(pr), m.spinner(), rolePending)
 	}
 	if f.Phase == domain.Failed || f.Phase == domain.Cooldown {
@@ -331,6 +334,9 @@ func (m Model) reviewValue(pr domain.PR) tableCell {
 		return stateCell(cellPending, "pending", roleUnrequested)
 	}
 	if f.Phase.Active() {
+		if f.HasValue && f.Stale(m.opts.Clock.Now()) {
+			return stateCell(cellStale, "stale", roleStale)
+		}
 		return loadingCell(m.loadingSummary(pr), m.spinner(), rolePending)
 	}
 	if f.Phase == domain.Failed || f.Phase == domain.Cooldown {
@@ -379,6 +385,9 @@ func (m Model) threadsCell(pr domain.PR) tableCell {
 		return stateCell(cellPending, "pending", roleUnrequested)
 	}
 	if f.Phase.Active() {
+		if f.HasValue && f.Stale(m.opts.Clock.Now()) {
+			return stateCell(cellStale, "stale", roleStale)
+		}
 		return loadingCell(m.loadingSummary(pr), m.spinner(), rolePending)
 	}
 	if f.Phase == domain.Failed || f.Phase == domain.Cooldown {

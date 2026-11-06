@@ -1,13 +1,62 @@
 package github
 
 import (
+	"context"
 	"encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/fullsend-ai/fs-dash/internal/domain"
 )
+
+func TestCombinedSummaryQueryDecodesEachFieldIndependently(t *testing.T) {
+	now := time.Date(2026, 11, 6, 17, 0, 0, 0, time.UTC)
+	reset := now.Add(time.Hour)
+	body := `{"data":{"viewer":{"login":"me"},"repository":{"pullRequest":{"reviews":{"nodes":[{"databaseId":4,"author":{"login":"reviewer","__typename":"User"},"state":"APPROVED","submittedAt":"2026-11-06T16:00:00Z"}],"pageInfo":{"hasPreviousPage":true}},"reviewRequests":{"nodes":[{"requestedReviewer":{"__typename":"User","login":"me"}}],"pageInfo":{"hasNextPage":false}},"reviewThreads":{"nodes":[{"isResolved":false},{"isResolved":true}],"pageInfo":{"hasNextPage":false}},"commits":{"nodes":[{"commit":{"statusCheckRollup":{"contexts":{"nodes":[{"__typename":"CheckRun","status":"COMPLETED","conclusion":"FAILURE"},{"__typename":"StatusContext","state":"PENDING"}],"pageInfo":{"hasNextPage":true}}}}}]}}}}}`
+	response := responseWithQuota("200 OK", 5000, 125, 4875, reset, body)
+	callFile := filepath.Join(t.TempDir(), "calls")
+	cli := filepath.Join(t.TempDir(), "gh")
+	script := fmt.Sprintf("#!/bin/sh\nprintf 'call\\n' >> %q\ncat <<'FS_DASH_BODY'\n%sFS_DASH_BODY\n", callFile, response)
+	if err := os.WriteFile(cli, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	item := domain.ItemID{Source: "github", Host: "github.com", Repo: "owner/repo", Number: 7}
+	keys := []domain.FieldKey{
+		{Item: item, Name: "checks", Revision: "head"},
+		{Item: item, Name: "reviews", Revision: "head"},
+		{Item: item, Name: "review_requests", Revision: "head"},
+		{Item: item, Name: "review_threads", Revision: "head"},
+	}
+	results := (Enricher{CLI: cli, Now: func() time.Time { return now }}).FetchFields(context.Background(), keys)
+	if calls, err := os.ReadFile(callFile); err != nil || strings.Count(string(calls), "call") != 1 {
+		t.Fatalf("combined request count = %q, err=%v", calls, err)
+	}
+	checks := results[keys[0]].Value.(domain.CheckSummary)
+	if checks.Failed != 1 || checks.Pending != 1 || checks.Total != 2 || checks.Complete {
+		t.Fatalf("incomplete checks summary = %+v", checks)
+	}
+	reviews := results[keys[1]].Value.(domain.ReviewSet)
+	if len(reviews.Reviews) != 1 || reviews.Complete || reviews.ViewerLogin != "me" {
+		t.Fatalf("incomplete review summary = %+v", reviews)
+	}
+	requests := results[keys[2]].Value.(domain.LoginSet)
+	if len(requests.Logins) != 1 || requests.Logins[0] != "me" || !requests.Complete {
+		t.Fatalf("complete review requests = %+v", requests)
+	}
+	threads := results[keys[3]].Value.(domain.ThreadSummary)
+	if threads.Unresolved != 1 || !threads.Complete {
+		t.Fatalf("complete review-thread summary = %+v", threads)
+	}
+	for _, key := range keys {
+		if results[key].Err != nil || results[key].Provenance.Quota == nil || results[key].Provenance.Quota.Remaining != 4875 {
+			t.Errorf("result metadata for %s = %+v", key.Name, results[key])
+		}
+	}
+}
 
 func TestClassifyActivityRequiresTrustedCurrentStatus(t *testing.T) {
 	now := time.Date(2026, 11, 3, 15, 0, 0, 0, time.UTC)

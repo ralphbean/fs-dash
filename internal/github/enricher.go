@@ -11,6 +11,8 @@ import (
 	"time"
 
 	"github.com/fullsend-ai/fs-dash/internal/domain"
+	"github.com/fullsend-ai/fs-dash/internal/fetch"
+	"github.com/fullsend-ai/fs-dash/internal/ports"
 )
 
 const reviewQuery = `query($owner: String!, $name: String!, $number: Int!) {
@@ -67,6 +69,34 @@ const threadQuery = `query($owner: String!, $name: String!, $number: Int!) {
   }
 }`
 
+const combinedSummaryQuery = `query($owner: String!, $name: String!, $number: Int!) {
+  viewer { login }
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $number) {
+      reviews(last: 100) {
+        nodes { databaseId author { login __typename } state submittedAt }
+        pageInfo { hasPreviousPage }
+      }
+      reviewRequests(first: 100) {
+        nodes { requestedReviewer { __typename ... on User { login } ... on Team { slug organization { login } } } }
+        pageInfo { hasNextPage }
+      }
+      reviewThreads(first: 100) {
+        nodes { isResolved }
+        pageInfo { hasNextPage }
+      }
+      commits(last: 1) {
+        nodes { commit { statusCheckRollup {
+          contexts(first: 100) {
+            nodes { __typename ... on CheckRun { status conclusion } ... on StatusContext { state } }
+            pageInfo { hasNextPage }
+          }
+        } } }
+      }
+    }
+  }
+}`
+
 const activityQuery = `query($owner: String!, $name: String!, $number: Int!) {
   repository(owner: $owner, name: $name) {
     pullRequest(number: $number) {
@@ -87,8 +117,9 @@ const lastTouchedQuery = `query($owner: String!, $name: String!, $number: Int!) 
 }`
 
 type Enricher struct {
-	CLI string
-	Now func() time.Time
+	CLI  string
+	Now  func() time.Time
+	Gate *fetch.RateLimitGate
 }
 
 type graphPage struct {
@@ -216,6 +247,11 @@ func (e Enricher) FetchField(ctx context.Context, key domain.FieldKey) (any, dom
 	if cli == "" {
 		cli = "gh"
 	}
+	if e.Gate != nil {
+		if err := e.Gate.Wait(ctx); err != nil {
+			return nil, domain.Provenance{}, fetch.Classify(err)
+		}
+	}
 	cmd := exec.CommandContext(ctx, cli, "api", "graphql", "--include", "-f", "query="+query,
 		"-F", "owner="+owner, "-F", "name="+name, "-F", fmt.Sprintf("number=%d", key.Item.Number))
 	output, err := cmd.CombinedOutput()
@@ -228,21 +264,24 @@ func (e Enricher) FetchField(ctx context.Context, key domain.FieldKey) (any, dom
 	provenance := domain.Provenance{Source: "github", Quota: quota}
 	if err != nil {
 		issue := classifyCLIError(err, string(output))
-		applyQuotaRetry(issue, quota)
+		applyRateLimitMetadata(e.Gate, issue, headers, quota, observedAt)
 		return nil, provenance, issue
 	}
 	if responseErr != nil {
+		applyRateLimitMetadata(e.Gate, nil, headers, quota, observedAt)
 		return nil, provenance, &domain.FetchError{Kind: domain.ErrorTransient, Message: "GitHub returned unreadable response metadata"}
 	}
 	var page graphPage
 	if err := json.NewDecoder(bytes.NewReader(body)).Decode(&page); err != nil {
+		applyRateLimitMetadata(e.Gate, nil, headers, quota, observedAt)
 		return nil, provenance, &domain.FetchError{Kind: domain.ErrorTransient, Message: "GitHub returned unreadable triage data"}
 	}
 	if len(page.Errors) > 0 {
 		issue := classifyCLIError(fmt.Errorf("GraphQL error"), page.Errors[0].Message)
-		applyQuotaRetry(issue, quota)
+		applyRateLimitMetadata(e.Gate, issue, headers, quota, observedAt)
 		return nil, provenance, issue
 	}
+	applyRateLimitMetadata(e.Gate, nil, headers, quota, observedAt)
 	if page.Data.Repository == nil || page.Data.Repository.PullRequest == nil {
 		return nil, provenance, &domain.FetchError{Kind: domain.ErrorPermission, Message: "GitHub pull request unavailable or access denied"}
 	}
@@ -264,6 +303,97 @@ func (e Enricher) FetchField(ctx context.Context, key domain.FieldKey) (any, dom
 	provenance.Version = now.Format(time.RFC3339Nano)
 	provenance.FreshUntil = now.Add(fieldFreshFor)
 	return value, provenance, nil
+}
+
+func (e Enricher) FetchFields(ctx context.Context, keys []domain.FieldKey) map[domain.FieldKey]ports.FieldResult {
+	results := make(map[domain.FieldKey]ports.FieldResult, len(keys))
+	if len(keys) == 0 {
+		return results
+	}
+	for _, key := range keys {
+		if key.Name != "checks" && key.Name != "reviews" && key.Name != "review_requests" && key.Name != "review_threads" {
+			results[key] = ports.FieldResult{Err: &domain.FetchError{Kind: domain.ErrorPermanent, Message: "unsupported combined GitHub field: " + key.Name}}
+			return results
+		}
+	}
+	first := keys[0]
+	for _, key := range keys[1:] {
+		if key.Item != first.Item || key.Revision != first.Revision {
+			for _, resultKey := range keys {
+				results[resultKey] = ports.FieldResult{Err: &domain.FetchError{Kind: domain.ErrorPermanent, Message: "combined GitHub fields must belong to one PR revision"}}
+			}
+			return results
+		}
+	}
+	owner, name, err := splitRepo(first.Item.Repo)
+	if err != nil {
+		for _, key := range keys {
+			results[key] = ports.FieldResult{Err: err}
+		}
+		return results
+	}
+	cli := e.CLI
+	if cli == "" {
+		cli = "gh"
+	}
+	if e.Gate != nil {
+		if err := e.Gate.Wait(ctx); err != nil {
+			for _, key := range keys {
+				results[key] = ports.FieldResult{Err: fetch.Classify(err)}
+			}
+			return results
+		}
+	}
+	cmd := exec.CommandContext(ctx, cli, "api", "graphql", "--include", "-f", "query="+combinedSummaryQuery,
+		"-F", "owner="+owner, "-F", "name="+name, "-F", fmt.Sprintf("number=%d", first.Item.Number))
+	output, commandErr := cmd.CombinedOutput()
+	observedAt := time.Now()
+	if e.Now != nil {
+		observedAt = e.Now()
+	}
+	headers, body, responseErr := parseIncludedResponse(output)
+	quota := parseQuotaObservation(headers, observedAt)
+	provenance := domain.Provenance{Source: "github", Quota: quota}
+	var requestErr error
+	switch {
+	case commandErr != nil:
+		issue := classifyCLIError(commandErr, string(output))
+		applyRateLimitMetadata(e.Gate, issue, headers, quota, observedAt)
+		requestErr = issue
+	case responseErr != nil:
+		applyRateLimitMetadata(e.Gate, nil, headers, quota, observedAt)
+		requestErr = &domain.FetchError{Kind: domain.ErrorTransient, Message: "GitHub returned unreadable response metadata"}
+	default:
+		var page graphPage
+		if err := json.NewDecoder(bytes.NewReader(body)).Decode(&page); err != nil {
+			applyRateLimitMetadata(e.Gate, nil, headers, quota, observedAt)
+			requestErr = &domain.FetchError{Kind: domain.ErrorTransient, Message: "GitHub returned unreadable triage data"}
+		} else if len(page.Errors) > 0 {
+			issue := classifyCLIError(fmt.Errorf("GraphQL error"), page.Errors[0].Message)
+			applyRateLimitMetadata(e.Gate, issue, headers, quota, observedAt)
+			requestErr = issue
+		} else {
+			applyRateLimitMetadata(e.Gate, nil, headers, quota, observedAt)
+		}
+		if requestErr == nil && (page.Data.Repository == nil || page.Data.Repository.PullRequest == nil) {
+			requestErr = &domain.FetchError{Kind: domain.ErrorPermission, Message: "GitHub pull request unavailable or access denied"}
+		} else if requestErr == nil {
+			provenance.FetchedAt = observedAt
+			provenance.Version = observedAt.Format(time.RFC3339Nano)
+			provenance.FreshUntil = observedAt.Add(fieldFreshFor)
+			for _, key := range keys {
+				value, fieldErr := fieldValue(key.Name, page.Data.Viewer.Login, page.Data.Repository.PullRequest, observedAt)
+				result := ports.FieldResult{Value: value, Provenance: provenance, Err: fieldErr}
+				results[key] = result
+			}
+		}
+	}
+	if requestErr != nil {
+		for _, key := range keys {
+			results[key] = ports.FieldResult{Provenance: provenance, Err: requestErr}
+		}
+	}
+	return results
 }
 
 var fieldQueries = map[string]string{

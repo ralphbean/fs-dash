@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/fullsend-ai/fs-dash/internal/domain"
+	"github.com/fullsend-ai/fs-dash/internal/fetch"
 )
 
 func quotaHeaders(limit, used, remaining int, reset time.Time) http.Header {
@@ -77,6 +78,46 @@ func TestIncludedQuotaResponseParsesHeadersAndRejectsMalformedMetadata(t *testin
 	}
 }
 
+func TestRetryAfterSupportsSecondsAndHTTPDates(t *testing.T) {
+	now := time.Date(2026, 11, 6, 17, 0, 0, 0, time.UTC)
+	for _, tc := range []struct {
+		name  string
+		value string
+		want  time.Duration
+	}{
+		{name: "seconds", value: "42", want: 42 * time.Second},
+		{name: "HTTP date", value: now.Add(90 * time.Second).Format(http.TimeFormat), want: 90 * time.Second},
+		{name: "invalid", value: "later", want: 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			headers := make(http.Header)
+			headers.Set("Retry-After", tc.value)
+			if got := parseRetryAfter(headers, now); got != tc.want {
+				t.Fatalf("Retry-After %q parsed as %s, want %s", tc.value, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestRateLimitMetadataHonorsRetryAfterAndPrimaryReset(t *testing.T) {
+	now := time.Date(2026, 11, 6, 17, 0, 0, 0, time.UTC)
+	gate := fetch.NewRateLimitGateWithClock(func() time.Time { return now })
+	headers := make(http.Header)
+	headers.Set("Retry-After", "45")
+	issue := &domain.FetchError{Kind: domain.ErrorRateLimit}
+	applyRateLimitMetadata(gate, issue, headers, nil, now)
+	if issue.RetryAfter != 45*time.Second || !issue.RetryAt.Equal(now.Add(45*time.Second)) {
+		t.Fatalf("secondary retry metadata = %+v", issue)
+	}
+	reset := now.Add(3 * time.Minute)
+	quota := &domain.QuotaObservation{Remaining: 0, ResetAt: reset}
+	issue = &domain.FetchError{Kind: domain.ErrorRateLimit}
+	applyRateLimitMetadata(gate, issue, headers, quota, now)
+	if !issue.RetryAt.Equal(reset) || issue.RetryAfter != 45*time.Second {
+		t.Fatalf("primary reset metadata = %+v", issue)
+	}
+}
+
 func TestPRListerCollectsConservativeQuotaAcrossPages(t *testing.T) {
 	reset := time.Now().Add(30 * time.Minute).Truncate(time.Second)
 	first := responseWithQuota("200 OK", 5000, 120, 4880, reset,
@@ -129,5 +170,43 @@ func TestEnricherCarriesQuotaFromResponse(t *testing.T) {
 	}
 	if provenance.Quota == nil || provenance.Quota.Remaining != 4875 || !provenance.Quota.ObservedAt.Equal(now) {
 		t.Fatalf("quota was not carried in provenance: %+v", provenance)
+	}
+}
+
+func TestManualFieldRefreshWaitsBehindSharedCooldown(t *testing.T) {
+	now := time.Date(2026, 11, 6, 17, 0, 0, 0, time.UTC)
+	gate := fetch.NewRateLimitGate()
+	issue := &domain.FetchError{Kind: domain.ErrorRateLimit}
+	gate.ObserveResponse(issue, nil, 35*time.Millisecond)
+	marker := filepath.Join(t.TempDir(), "request-sent")
+	cli := filepath.Join(t.TempDir(), "gh")
+	body := `{"data":{"repository":{"pullRequest":{"timelineItems":{"updatedAt":"2026-11-06T16:45:00Z"}}}}}`
+	response := responseWithQuota("200 OK", 5000, 125, 4875, now.Add(time.Hour), body)
+	script := fmt.Sprintf("#!/bin/sh\nprintf sent > %q\ncat <<'FS_DASH_BODY'\n%sFS_DASH_BODY\n", marker, response)
+	if err := os.WriteFile(cli, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	type result struct{ err error }
+	done := make(chan result, 1)
+	go func() {
+		_, _, err := (Enricher{CLI: cli, Gate: gate, Now: func() time.Time { return now }}).FetchField(context.Background(), domain.FieldKey{
+			Item: domain.ItemID{Source: "github", Host: "github.com", Repo: "o/r", Number: 1}, Name: "last_touched", Revision: "head",
+		})
+		done <- result{err: err}
+	}()
+	time.Sleep(10 * time.Millisecond)
+	if _, err := os.Stat(marker); !os.IsNotExist(err) {
+		t.Fatalf("manual refresh reached GitHub during cooldown, stat err=%v", err)
+	}
+	select {
+	case got := <-done:
+		if got.err != nil {
+			t.Fatal(got.err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("manual refresh did not resume after cooldown")
+	}
+	if _, err := os.Stat(marker); err != nil {
+		t.Fatalf("manual refresh was not sent after cooldown: %v", err)
 	}
 }

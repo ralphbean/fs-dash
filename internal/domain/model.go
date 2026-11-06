@@ -96,9 +96,10 @@ const (
 )
 
 type FetchError struct {
-	Kind    ErrorKind
-	Message string
-	RetryAt time.Time
+	Kind       ErrorKind
+	Message    string
+	RetryAt    time.Time
+	RetryAfter time.Duration
 }
 
 func (e *FetchError) Error() string {
