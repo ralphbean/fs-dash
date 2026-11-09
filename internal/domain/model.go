@@ -197,6 +197,8 @@ type Review struct {
 	State  string
 	At     time.Time
 	ID     string
+	Body   string
+	URL    string
 }
 
 type ReviewSet struct {

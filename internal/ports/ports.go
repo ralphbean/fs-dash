@@ -25,6 +25,18 @@ type BatchEnricher interface {
 	FetchFields(ctx context.Context, keys []domain.FieldKey) map[domain.FieldKey]FieldResult
 }
 
+type PRDetailReader interface {
+	FetchDetail(ctx context.Context, key domain.DetailKey) (any, domain.Provenance, error)
+}
+
+type PRActionClient interface {
+	InspectPR(ctx context.Context, item domain.ItemID) (domain.PRActionState, error)
+	PostPRComment(ctx context.Context, item domain.ItemID, body string) (string, error)
+	ReplyToReviewThread(ctx context.Context, item domain.ItemID, threadID, body string) (string, error)
+	MergePR(ctx context.Context, item domain.ItemID, expectedHead string, state domain.PRActionState) error
+	ClosePR(ctx context.Context, item domain.ItemID, expectedHead string) error
+}
+
 type Clock interface{ Now() time.Time }
 
 type LogEvent struct {

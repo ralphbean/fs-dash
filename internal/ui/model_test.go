@@ -163,7 +163,7 @@ func TestExpiredCooldownCanRequeueCombinedSummarySibling(t *testing.T) {
 }
 
 func TestEnrichmentCacheRestoresFreshAndStaleValuesOnlyForMatchingRevision(t *testing.T) {
-	now := time.Date(2026, 11, 6, 17, 0, 0, 0, time.UTC)
+	now := time.Now().UTC()
 	store := enrichmentcache.NewFileStore(filepath.Join(t.TempDir(), "github-cache.json"))
 	item := domain.ItemID{Source: "github", Host: "github.com", Repo: "owner/repo", Number: 8}
 	checksKey := domain.FieldKey{Item: item, Name: "checks", Revision: "head-1"}

@@ -75,7 +75,8 @@ func main() {
 		enrichmentStore = enrichmentcache.NewFileStore(cachePath)
 	}
 	gate := fetch.NewRateLimitGate()
-	options := ui.Options{Config: cfg, Repos: repos, Lister: github.PRLister{Gate: gate}, Enricher: github.Enricher{Gate: gate}, Runner: localcmd.Runner{}, Reminders: triageStore, ReminderLoadError: triageErr, DisplayPreferences: preferenceStore, PreferenceLoadError: preferenceErr, EnrichmentCache: enrichmentStore, CacheLoadError: cacheErr}
+	detailClient := github.DetailClient{Gate: gate}
+	options := ui.Options{Config: cfg, Repos: repos, Lister: github.PRLister{Gate: gate}, Enricher: github.Enricher{Gate: gate}, Details: detailClient, Actions: detailClient, Runner: localcmd.Runner{}, Reminders: triageStore, ReminderLoadError: triageErr, DisplayPreferences: preferenceStore, PreferenceLoadError: preferenceErr, EnrichmentCache: enrichmentStore, CacheLoadError: cacheErr}
 	if _, err := tea.NewProgram(ui.New(options), tea.WithAltScreen()).Run(); err != nil {
 		fmt.Fprintln(os.Stderr, "fs-dash:", err)
 		os.Exit(1)

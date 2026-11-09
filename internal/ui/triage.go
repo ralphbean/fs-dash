@@ -1402,6 +1402,15 @@ func (m Model) View() string {
 	if m.mode == "details" {
 		return m.detailsView()
 	}
+	if m.mode == "thread" {
+		return m.threadView()
+	}
+	if m.mode == "editor" {
+		return m.editorView()
+	}
+	if m.mode == "confirm" {
+		return m.confirmView()
+	}
 	if m.mode == "snooze" {
 		return m.snoozeView()
 	}

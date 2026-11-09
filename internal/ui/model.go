@@ -25,6 +25,8 @@ type Options struct {
 	Repos               []string
 	Lister              ports.PRLister
 	Enricher            ports.Enricher
+	Details             ports.PRDetailReader
+	Actions             ports.PRActionClient
 	Scheduler           *fetch.Scheduler
 	ActivityScheduler   *fetch.Scheduler
 	Runner              ports.CommandRunner
@@ -60,6 +62,8 @@ type Model struct {
 	status                          string
 	reminderWarning                 string
 	fields                          map[domain.FieldKey]*domain.Field[any]
+	detailFields                    map[domain.DetailKey]*domain.Field[any]
+	detailAttempts                  map[domain.DetailKey]int
 	cacheEntries                    map[domain.FieldKey]enrichmentcache.Entry
 	cacheGeneration                 uint64
 	cacheCompletedGeneration        uint64
@@ -107,6 +111,20 @@ type Model struct {
 	activityOffscreenWakeReady      bool
 	activityOffscreenGeneration     uint64
 	visual                          visualTheme
+	detailsScroll                   int
+	threadIndex                     int
+	threadScroll                    int
+	editorReturnMode                string
+	editorThreadID                  string
+	editorBuffer                    []rune
+	editorScroll                    int
+	prCommentDraft                  string
+	replyDrafts                     map[string]string
+	writePending                    *pendingWrite
+	confirmAction                   string
+	actionState                     *domain.PRActionState
+	actionChecking                  bool
+	actionRunning                   bool
 }
 type listMsg struct {
 	repo       string
@@ -185,7 +203,7 @@ func New(opts Options) Model {
 	if opts.Reminders == nil {
 		opts.Reminders = reminder.NewMemoryStore()
 	}
-	m := Model{opts: opts, mode: "list", logLevel: "all", width: 100, height: 30, fields: map[domain.FieldKey]*domain.Field[any]{}, cacheEntries: map[domain.FieldKey]enrichmentcache.Entry{}, fieldAttempts: map[domain.FieldKey]int{}, fieldQueued: map[domain.FieldKey]bool{}, fieldQueueGeneration: map[domain.FieldKey]uint64{}, fieldPriorityGeneration: map[domain.FieldKey]uint64{}, fieldInFlight: map[domain.FieldKey]uint64{}, fieldRequestForKey: map[domain.FieldKey]string{}, fieldRequestsInFlight: map[string]int{}, activityQueued: map[domain.FieldKey]bool{}, activityQueueGeneration: map[domain.FieldKey]uint64{}, activityPriorityGeneration: map[domain.FieldKey]uint64{}, activityInFlight: map[domain.FieldKey]uint64{}, filter: triage.FilterAuthored, emojiMode: true, visual: newVisualTheme(opts.Config)}
+	m := Model{opts: opts, mode: "list", logLevel: "all", width: 100, height: 30, fields: map[domain.FieldKey]*domain.Field[any]{}, detailFields: map[domain.DetailKey]*domain.Field[any]{}, detailAttempts: map[domain.DetailKey]int{}, replyDrafts: map[string]string{}, cacheEntries: map[domain.FieldKey]enrichmentcache.Entry{}, fieldAttempts: map[domain.FieldKey]int{}, fieldQueued: map[domain.FieldKey]bool{}, fieldQueueGeneration: map[domain.FieldKey]uint64{}, fieldPriorityGeneration: map[domain.FieldKey]uint64{}, fieldInFlight: map[domain.FieldKey]uint64{}, fieldRequestForKey: map[domain.FieldKey]string{}, fieldRequestsInFlight: map[string]int{}, activityQueued: map[domain.FieldKey]bool{}, activityQueueGeneration: map[domain.FieldKey]uint64{}, activityPriorityGeneration: map[domain.FieldKey]uint64{}, activityInFlight: map[domain.FieldKey]uint64{}, filter: triage.FilterAuthored, emojiMode: true, visual: newVisualTheme(opts.Config)}
 	m.visual.compact = m.width < 64
 	if opts.ReminderLoadError != nil {
 		m.reminderWarning = "Local triage state: " + opts.ReminderLoadError.Error()
@@ -549,6 +567,11 @@ func (m Model) active() bool {
 			}
 		}
 	}
+	for _, field := range m.detailFields {
+		if field.Phase.Active() {
+			return true
+		}
+	}
 	return false
 }
 func (m *Model) maybeTick(cmds *[]tea.Cmd) {
@@ -668,6 +691,11 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			m.touchCacheForPRs(msg.value)
 			cmds = append(cmds, m.enqueueListPrefetch(msg.repo, msg.generation, msg.value))
 			cmds = append(cmds, m.selectedFields(false)...)
+			if m.mode == "details" || m.mode == "thread" {
+				if selected, ok := m.selectedPR(); ok {
+					cmds = append(cmds, m.loadDetailGroups(selected, false)...)
+				}
+			}
 		}
 	case retryMsg:
 		s := m.section(msg.repo)
@@ -710,6 +738,16 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 				cmds = append(cmds, m.startFieldFetches()...)
 			}
 		}
+	case detailFetchMsg:
+		cmds = append(cmds, m.applyDetailMessage(msg)...)
+	case detailRetryMsg:
+		cmds = append(cmds, m.retryDetail(msg)...)
+	case actionInspectMsg:
+		m.applyActionInspect(msg)
+	case actionMutationMsg:
+		cmds = append(cmds, m.applyActionMutation(msg)...)
+	case commentMutationMsg:
+		cmds = append(cmds, m.applyCommentMutation(msg)...)
 	case commandMsg:
 		if msg.err != nil {
 			m.status = fmt.Sprintf("%s command failed: %v", msg.key, msg.err)
@@ -720,8 +758,20 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		}
 	case tea.KeyMsg:
 		key := msg.String()
+		if m.mode == "editor" {
+			cmds = append(cmds, m.handleEditorKey(msg)...)
+			break
+		}
 		if key == "ctrl+c" {
 			return m, tea.Quit
+		}
+		if m.mode == "confirm" {
+			cmds = append(cmds, m.handleConfirmKey(key)...)
+			break
+		}
+		if m.mode == "thread" {
+			cmds = append(cmds, m.handleThreadKey(key)...)
+			break
 		}
 		if m.console {
 			switch key {
@@ -782,8 +832,8 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			break
 		}
-		if m.mode == "details" && key == "esc" {
-			m.mode = "list"
+		if m.mode == "details" {
+			cmds = append(cmds, m.handleDetailsKey(key)...)
 			break
 		}
 		switch key {
@@ -799,7 +849,7 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		case "enter":
 			if m.hasSelection {
-				m.mode = "details"
+				cmds = append(cmds, m.openDetails()...)
 			}
 		case "r":
 			for i := range m.sections {
@@ -998,36 +1048,13 @@ func (m Model) filterCountSummary(s section, projected triage.Sections) string {
 	return summary
 }
 
-func (m Model) detailsView() string {
-	pr, ok := m.selectedPR()
-	if !ok {
-		return strings.Join(m.visual.panel("PR details", []string{"PR no longer in list · esc back"}, m.width), "\n") + "\n"
-	}
-	content := []string{
-		m.visual.paint(roleAccent, fmt.Sprintf("%s #%d", pr.ID.Repo, pr.ID.Number)),
-		m.visual.paint(roleNeutral, pr.Title),
-		"Author: " + m.visual.paint(roleNeutral, pr.Author),
-		"Updated: " + m.visual.paint(roleNeutral, pr.UpdatedAt.Local().Format(time.RFC822)),
-		"Head: " + m.visual.paint(roleMuted, pr.HeadSHA),
-		"URL: " + m.visual.paint(roleLink, pr.URL),
-		m.visual.paint(roleMuted, "Review and check signals are summarized in the list; detailed review threads arrive in change 03."),
-	}
-	lines := append(m.visual.header("fs-dash · PR details", pr.ID.Repo, m.width), m.visual.panel("Pull request", content, m.width)...)
-	lines = append(lines, m.quotaStatusLine())
-	if m.status != "" {
-		lines = append(lines, m.visual.paint(roleWarning, m.visual.fit(m.status, m.width)))
-	}
-	lines = append(lines, m.visual.footer("esc back · o open · L logs · ? help · q quit", m.width))
-	return strings.Join(lines, "\n") + "\n"
-}
-
 func (m Model) helpView() string {
 	keys := make([]string, 0, len(m.opts.Config.Bindings))
 	for key := range m.opts.Config.Bindings {
 		keys = append(keys, key)
 	}
 	sort.Strings(keys)
-	content := []string{"j/k or arrows  move selection", "h/l            previous/next filter", "e              toggle emoji/text table labels", "enter          PR details", "esc            back", "s              toggle local star", "z              choose snooze duration", "u              unsnooze selected PR", "r              refresh all sections", "L              log console", "?              toggle help", "q              quit"}
+	content := []string{"j/k or arrows  move selection", "h/l            previous/next filter", "e              toggle emoji/text table labels", "enter          PR details", "details: j/k scroll · T threads · c comment · m merge/queue · x close · r refresh", "threads: n/p next/previous · j/k scroll · r reply", "editor: enter newline · ctrl+s post · esc cancel", "esc            back", "s              toggle local star", "z              choose snooze duration", "u              unsnooze selected PR", "r              refresh all sections", "L              log console", "?              toggle help", "q              quit"}
 	for _, key := range keys {
 		binding := m.opts.Config.Bindings[key]
 		summary := binding.Summary
