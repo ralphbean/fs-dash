@@ -117,6 +117,7 @@ type Model struct {
 	editorReturnMode                string
 	editorThreadID                  string
 	editorBuffer                    []rune
+	editorCursor                    int
 	editorScroll                    int
 	prCommentDraft                  string
 	replyDrafts                     map[string]string
@@ -748,6 +749,8 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		cmds = append(cmds, m.applyActionMutation(msg)...)
 	case commentMutationMsg:
 		cmds = append(cmds, m.applyCommentMutation(msg)...)
+	case threadResolveMsg:
+		cmds = append(cmds, m.applyThreadResolve(msg)...)
 	case commandMsg:
 		if msg.err != nil {
 			m.status = fmt.Sprintf("%s command failed: %v", msg.key, msg.err)
@@ -1054,7 +1057,7 @@ func (m Model) helpView() string {
 		keys = append(keys, key)
 	}
 	sort.Strings(keys)
-	content := []string{"j/k or arrows  move selection", "h/l            previous/next filter", "e              toggle emoji/text table labels", "enter          PR details", "details: j/k scroll · T threads · c comment · m merge/queue · x close · r refresh", "threads: n/p next/previous · j/k scroll · r reply", "editor: enter newline · ctrl+s post · esc cancel", "esc            back", "s              toggle local star", "z              choose snooze duration", "u              unsnooze selected PR", "r              refresh all sections", "L              log console", "?              toggle help", "q              quit"}
+	content := []string{"j/k or arrows  move selection", "h/l            previous/next filter", "e              toggle emoji/text table labels", "enter          PR details", "details: j/k scroll · T threads · c comment · m merge/queue · x close · r refresh", "threads: n/p next/previous · c comment · r resolve · R refresh", "comment: ctrl+d post · ctrl+k kill line · ctrl+w delete word · ctrl+e end line · ctrl+left/right word · ctrl+a line start", "editor: ←/→ cursor · ctrl+left/right word · ctrl+a line start · ↑/↓ scroll · enter newline · ctrl+d post · esc cancel", "esc            back", "s              toggle local star", "z              choose snooze duration", "u              unsnooze selected PR", "r              refresh all sections", "L              log console", "?              toggle help", "q              quit"}
 	for _, key := range keys {
 		binding := m.opts.Config.Bindings[key]
 		summary := binding.Summary

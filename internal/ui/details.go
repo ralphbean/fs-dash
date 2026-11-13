@@ -6,6 +6,7 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -52,6 +53,12 @@ type commentMutationMsg struct {
 	startedAt time.Time
 	commentID string
 	err       error
+}
+
+type threadResolveMsg struct {
+	item     domain.ItemID
+	threadID string
+	err      error
 }
 
 type pendingWrite struct {
@@ -314,7 +321,6 @@ func (m *Model) handleThreadKey(key string) []tea.Cmd {
 		return nil
 	}
 	threads := m.threadList(pr)
-	threadField := m.detailFields[detailKey(pr, "threads")]
 	switch key {
 	case "esc", "T":
 		m.mode = "details"
@@ -335,15 +341,61 @@ func (m *Model) handleThreadKey(key string) []tea.Cmd {
 		m.threadScroll++
 	case "k", "up":
 		m.threadScroll = max(0, m.threadScroll-1)
-	case "r":
-		if threadField == nil || !threadField.HasValue || threadField.Phase == domain.Failed || threadField.Stale(m.opts.Clock.Now()) {
-			return []tea.Cmd{m.loadDetail(pr, detailKey(pr, "threads"), true)}
-		}
+	case "R":
+		return []tea.Cmd{m.loadDetail(pr, detailKey(pr, "threads"), true)}
+	case "c":
 		if len(threads) > 0 {
 			m.beginEditor(threads[m.threadIndex].ID, "thread")
 		}
+	case "r":
+		threadField := m.detailFields[detailKey(pr, "threads")]
+		if threadField == nil || !threadField.HasValue || threadField.Phase == domain.Failed || threadField.Stale(m.opts.Clock.Now()) {
+			m.status = "Refreshing thread state before resolving"
+			return []tea.Cmd{m.loadDetail(pr, detailKey(pr, "threads"), true)}
+		}
+		if len(threads) > 0 {
+			return m.resolveReviewThread(pr, threads[m.threadIndex].ID)
+		}
 	}
 	return nil
+}
+
+func (m *Model) resolveReviewThread(pr domain.PR, threadID string) []tea.Cmd {
+	if m.opts.Actions == nil {
+		m.status = "GitHub thread actions are unavailable"
+		return nil
+	}
+	if m.actionRunning || m.actionChecking || m.writePending != nil {
+		m.status = "Wait for the current GitHub action to finish"
+		return nil
+	}
+	client, scheduler, item := m.opts.Actions, m.opts.Scheduler, pr.ID
+	if scheduler == nil {
+		scheduler = fetch.NewRateLimitedScheduler(2, 150*time.Millisecond, 20*time.Second)
+	}
+	m.actionRunning = true
+	m.status = "Resolving review thread"
+	return []tea.Cmd{func() tea.Msg {
+		_, err := scheduler.Do(context.Background(), "github-mutation", fmt.Sprintf("resolve-thread:%s:%s:%d", item.String(), threadID, time.Now().UnixNano()), func(ctx context.Context) (any, error) {
+			return nil, client.ResolveReviewThread(ctx, item, threadID)
+		})
+		return threadResolveMsg{item: item, threadID: threadID, err: err}
+	}}
+}
+
+func (m *Model) applyThreadResolve(msg threadResolveMsg) []tea.Cmd {
+	m.actionRunning = false
+	pr, ok := m.selectedPR()
+	if !ok || pr.ID != msg.item {
+		m.status = "PR selection changed before thread resolution was verified"
+		return nil
+	}
+	if msg.err != nil {
+		m.status = "Thread resolution could not be verified; press R to refresh: " + fetch.Classify(msg.err).Message
+		return nil
+	}
+	m.status = "Thread resolved and verified; refreshing unresolved threads"
+	return []tea.Cmd{m.loadDetail(pr, detailKey(pr, "threads"), true)}
 }
 
 func (m *Model) beginEditor(threadID, returnMode string) {
@@ -357,25 +409,97 @@ func (m *Model) beginEditor(threadID, returnMode string) {
 	} else {
 		m.editorBuffer = []rune(m.replyDrafts[threadID])
 	}
+	m.editorCursor = len(m.editorBuffer)
 	m.mode = "editor"
 	m.saveEditorDraft()
 }
 
 func (m *Model) handleEditorKey(msg tea.KeyMsg) []tea.Cmd {
 	key := msg.String()
+	if m.editorCursor < 0 {
+		m.editorCursor = 0
+	}
+	if m.editorCursor > len(m.editorBuffer) {
+		m.editorCursor = len(m.editorBuffer)
+	}
 	switch key {
 	case "esc", "ctrl+c":
 		m.saveEditorDraft()
 		m.mode = m.editorReturnMode
-	case "ctrl+s", "ctrl+enter":
+	case "ctrl+d", "ctrl+enter":
 		return m.submitEditor()
 	case "backspace", "ctrl+h":
-		if len(m.editorBuffer) > 0 {
-			m.editorBuffer = m.editorBuffer[:len(m.editorBuffer)-1]
+		if m.editorCursor > 0 {
+			m.editorBuffer = append(m.editorBuffer[:m.editorCursor-1], m.editorBuffer[m.editorCursor:]...)
+			m.editorCursor--
 		}
 		m.saveEditorDraft()
+	case "delete":
+		if m.editorCursor < len(m.editorBuffer) {
+			m.editorBuffer = append(m.editorBuffer[:m.editorCursor], m.editorBuffer[m.editorCursor+1:]...)
+		}
+		m.saveEditorDraft()
+	case "left":
+		m.editorCursor = max(0, m.editorCursor-1)
+		m.saveEditorDraft()
+	case "right":
+		m.editorCursor = min(len(m.editorBuffer), m.editorCursor+1)
+		m.saveEditorDraft()
+	case "ctrl+left":
+		for m.editorCursor > 0 && unicode.IsSpace(m.editorBuffer[m.editorCursor-1]) {
+			m.editorCursor--
+		}
+		for m.editorCursor > 0 && !unicode.IsSpace(m.editorBuffer[m.editorCursor-1]) {
+			m.editorCursor--
+		}
+		m.saveEditorDraft()
+	case "ctrl+right":
+		for m.editorCursor < len(m.editorBuffer) && !unicode.IsSpace(m.editorBuffer[m.editorCursor]) {
+			m.editorCursor++
+		}
+		for m.editorCursor < len(m.editorBuffer) && unicode.IsSpace(m.editorBuffer[m.editorCursor]) {
+			m.editorCursor++
+		}
+		m.saveEditorDraft()
+	case "ctrl+a":
+		for m.editorCursor > 0 && m.editorBuffer[m.editorCursor-1] != '\n' {
+			m.editorCursor--
+		}
+		m.saveEditorDraft()
+	case "home":
+		for m.editorCursor > 0 && m.editorBuffer[m.editorCursor-1] != '\n' {
+			m.editorCursor--
+		}
+		m.saveEditorDraft()
+	case "end", "ctrl+e":
+		for m.editorCursor < len(m.editorBuffer) && m.editorBuffer[m.editorCursor] != '\n' {
+			m.editorCursor++
+		}
+		m.saveEditorDraft()
+	case "ctrl+k":
+		lineEnd := m.editorCursor
+		for lineEnd < len(m.editorBuffer) && m.editorBuffer[lineEnd] != '\n' {
+			lineEnd++
+		}
+		if lineEnd == m.editorCursor && lineEnd < len(m.editorBuffer) {
+			lineEnd++
+		}
+		m.editorBuffer = append(m.editorBuffer[:m.editorCursor], m.editorBuffer[lineEnd:]...)
+		m.saveEditorDraft()
+	case "ctrl+w":
+		start := m.editorCursor
+		for start > 0 && unicode.IsSpace(m.editorBuffer[start-1]) {
+			start--
+		}
+		for start > 0 && !unicode.IsSpace(m.editorBuffer[start-1]) {
+			start--
+		}
+		m.editorBuffer = append(m.editorBuffer[:start], m.editorBuffer[m.editorCursor:]...)
+		m.editorCursor = start
+		m.saveEditorDraft()
 	case "enter":
-		m.editorBuffer = append(m.editorBuffer, '\n')
+		m.editorBuffer = insertEditorRunes(m.editorBuffer, m.editorCursor, []rune{'\n'})
+		m.editorCursor++
 		m.saveEditorDraft()
 	case "up":
 		m.editorScroll = max(0, m.editorScroll-1)
@@ -383,11 +507,21 @@ func (m *Model) handleEditorKey(msg tea.KeyMsg) []tea.Cmd {
 		m.editorScroll++
 	default:
 		if len(msg.Runes) > 0 {
-			m.editorBuffer = append(m.editorBuffer, msg.Runes...)
+			m.editorBuffer = insertEditorRunes(m.editorBuffer, m.editorCursor, msg.Runes)
+			m.editorCursor += len(msg.Runes)
 			m.saveEditorDraft()
 		}
 	}
 	return nil
+}
+
+func insertEditorRunes(buffer []rune, cursor int, inserted []rune) []rune {
+	cursor = max(0, min(cursor, len(buffer)))
+	result := make([]rune, 0, len(buffer)+len(inserted))
+	result = append(result, buffer[:cursor]...)
+	result = append(result, inserted...)
+	result = append(result, buffer[cursor:]...)
+	return result
 }
 
 func (m *Model) saveEditorDraft() {
@@ -397,9 +531,59 @@ func (m *Model) saveEditorDraft() {
 	} else {
 		m.replyDrafts[m.editorThreadID] = draft
 	}
-	content := appendBodyLines(nil, draft, max(20, m.width-6))
+	_, cursorLine := editorDisplayLines(m.editorBuffer, m.editorCursor, max(20, m.width-6))
 	pageSize := max(1, m.height-9)
-	m.editorScroll = max(0, len(content)-pageSize)
+	if m.editorThreadID != "" {
+		pageSize = max(1, min(5, m.height/5))
+	}
+	if cursorLine < m.editorScroll {
+		m.editorScroll = cursorLine
+	} else if cursorLine >= m.editorScroll+pageSize {
+		m.editorScroll = cursorLine - pageSize + 1
+	}
+}
+
+func editorDisplayLines(buffer []rune, cursor, width int) ([]string, int) {
+	width = max(1, width)
+	cursor = max(0, min(cursor, len(buffer)))
+	lines := make([]string, 0, 1)
+	var current strings.Builder
+	currentWidth := 0
+	cursorLine := 0
+	flush := func() {
+		lines = append(lines, current.String())
+		current.Reset()
+		currentWidth = 0
+	}
+	appendRune := func(value rune) {
+		valueWidth := lipgloss.Width(string(value))
+		if current.Len() > 0 && currentWidth+valueWidth > width {
+			flush()
+		}
+		current.WriteRune(value)
+		currentWidth += valueWidth
+	}
+	for index := 0; index <= len(buffer); index++ {
+		if index == cursor {
+			caretWidth := lipgloss.Width("▏")
+			if current.Len() > 0 && currentWidth+caretWidth > width {
+				flush()
+			}
+			cursorLine = len(lines)
+			current.WriteString("▏")
+			currentWidth += caretWidth
+		}
+		if index == len(buffer) {
+			break
+		}
+		if buffer[index] == '\n' {
+			flush()
+			continue
+		}
+		appendRune(buffer[index])
+	}
+	lines = append(lines, current.String())
+	return lines, cursorLine
 }
 
 func (m *Model) submitEditor() []tea.Cmd {
@@ -514,6 +698,7 @@ func (m *Model) completePendingWrite() {
 		delete(m.replyDrafts, threadID)
 	}
 	m.editorBuffer = nil
+	m.editorCursor = 0
 	m.mode = m.editorReturnMode
 	if threadID == "" {
 		m.status = "PR comment posted and verified"
@@ -906,6 +1091,45 @@ func (m Model) detailsView() string {
 	return strings.Join(lines, "\n") + "\n"
 }
 
+func diffHunkLines(theme visualTheme, hunk string) []string {
+	if hunk == "" {
+		return []string{theme.paint(roleMuted, "(diff context unavailable)")}
+	}
+	lines := make([]string, 0, strings.Count(hunk, "\n")+1)
+	for _, line := range strings.Split(hunk, "\n") {
+		role := roleNeutral
+		switch {
+		case strings.HasPrefix(line, "@@"):
+			role = roleAccent
+		case strings.HasPrefix(line, "+++") || strings.HasPrefix(line, "---") || strings.HasPrefix(line, "\\"):
+			role = roleMuted
+		case strings.HasPrefix(line, "+"):
+			role = roleSuccess
+		case strings.HasPrefix(line, "-"):
+			role = roleFailure
+		}
+		lines = append(lines, theme.paint(role, line))
+	}
+	return lines
+}
+
+func (m Model) commentWindow(comment domain.ReviewThreadComment, width int) []string {
+	width = max(8, width)
+	innerWidth := max(1, width-4)
+	title := fmt.Sprintf("%s · %s", comment.Author, comment.CreatedAt.Local().Format("Jan 02 15:04"))
+	title = m.visual.fit(title, max(0, width-6))
+	label := m.visual.paint(roleBorder, "─ ") + m.visual.paint(roleAccent, title) + m.visual.paint(roleBorder, " ")
+	top := m.visual.paint(roleBorder, "┌") + label + m.visual.paint(roleBorder, strings.Repeat("─", max(0, width-2-lipgloss.Width(label)))) + m.visual.paint(roleBorder, "┐")
+	lines := []string{top}
+	for _, bodyLine := range appendBodyLines(nil, comment.Body, innerWidth) {
+		bodyLine = m.visual.fit(bodyLine, innerWidth)
+		padding := max(0, innerWidth-lipgloss.Width(bodyLine))
+		lines = append(lines, m.visual.paint(roleBorder, "│ ")+bodyLine+strings.Repeat(" ", padding)+m.visual.paint(roleBorder, " │"))
+	}
+	lines = append(lines, m.visual.paint(roleBorder, "└"+strings.Repeat("─", max(0, width-2))+"┘"))
+	return lines
+}
+
 func (m Model) threadView() string {
 	pr, ok := m.selectedPR()
 	if !ok {
@@ -913,15 +1137,23 @@ func (m Model) threadView() string {
 	}
 	threadField := m.detailFields[detailKey(pr, "threads")]
 	if threadField == nil || !threadField.HasValue {
-		lines := []string{"Loading unresolved review threads", m.detailStateLine(detailKey(pr, "threads")), "esc back · r retry"}
+		lines := []string{"Loading unresolved review threads", m.detailStateLine(detailKey(pr, "threads")), "esc back · R refresh"}
 		return strings.Join(m.visual.panel("Review threads", lines, m.width), "\n") + "\n"
 	}
 	threads := m.threadList(pr)
 	if len(threads) == 0 {
-		return strings.Join(m.visual.panel("Review threads", []string{"No unresolved review threads", "esc back · T return to details"}, m.width), "\n") + "\n"
+		return strings.Join(m.visual.panel("Review threads", []string{"No unresolved review threads", "esc back · T return to details · R refresh"}, m.width), "\n") + "\n"
 	}
 	if m.threadIndex >= len(threads) {
 		m.threadIndex = len(threads) - 1
+	}
+	if m.mode == "editor" && m.editorThreadID != "" {
+		for index, thread := range threads {
+			if thread.ID == m.editorThreadID {
+				m.threadIndex = index
+				break
+			}
+		}
 	}
 	thread := threads[m.threadIndex]
 	lines := []string{fmt.Sprintf("Thread %d of %d · %s", m.threadIndex+1, len(threads), thread.ID), "File: " + thread.Path}
@@ -940,20 +1172,24 @@ func (m Model) threadView() string {
 		lines = append(lines, "Diff context · "+m.detailStateLine(contextKey))
 	} else if context, ok := contextField.Value.(domain.ReviewThreadContext); ok {
 		lines = append(lines, "Diff context:")
-		lines = appendBodyLines(lines, context.DiffHunk, max(20, m.width-6))
+		lines = append(lines, diffHunkLines(m.visual, context.DiffHunk)...)
 		if context.IsOutdated {
 			lines = append(lines, "Original location is outdated; this hunk is historical context.")
 		}
 	}
 	lines = append(lines, "", "Thread history:")
 	for _, comment := range thread.Comments {
-		lines = append(lines, fmt.Sprintf("%s · %s", comment.Author, comment.CreatedAt.Local().Format("Jan 02 15:04")))
-		lines = appendBodyLines(lines, comment.Body, max(20, m.width-6))
+		lines = append(lines, m.commentWindow(comment, max(8, m.width-4))...)
+		lines = append(lines, "")
 	}
 	if !thread.CommentsComplete {
 		lines = append(lines, "Older thread comments not loaded")
 	}
+	editing := m.mode == "editor" && m.editorThreadID == thread.ID
 	pageSize := max(1, m.height-8)
+	if editing {
+		pageSize = max(1, m.height-15)
+	}
 	maxScroll := max(0, len(lines)-pageSize)
 	start := min(m.threadScroll, maxScroll)
 	end := min(len(lines), start+pageSize)
@@ -968,10 +1204,29 @@ func (m Model) threadView() string {
 		visible = append(visible, "↓ more below")
 	}
 	view := append(m.visual.header("fs-dash · Review threads", pr.ID.Repo, m.width), m.visual.panel("Unresolved review thread", visible, m.width)...)
+	if editing {
+		draftLines, _ := editorDisplayLines(m.editorBuffer, m.editorCursor, max(20, m.width-6))
+		composerPageSize := max(1, min(5, m.height/5))
+		composerStart := min(m.editorScroll, max(0, len(draftLines)-composerPageSize))
+		composerEnd := min(len(draftLines), composerStart+composerPageSize)
+		composerLines := []string{"ctrl+d post · ←/→ cursor · ↑/↓ scroll · enter newline"}
+		if composerStart > 0 {
+			composerLines = append(composerLines, "↑ earlier draft lines")
+		}
+		composerLines = append(composerLines, draftLines[composerStart:composerEnd]...)
+		if composerEnd < len(draftLines) {
+			composerLines = append(composerLines, "↓ more draft lines")
+		}
+		view = append(view, m.visual.panel("Comment draft", composerLines, m.width)...)
+	}
 	if m.status != "" {
 		view = append(view, m.visual.paint(roleWarning, m.visual.fit(m.status, m.width)))
 	}
-	view = append(view, m.visual.footer("esc back · n/p next/previous thread · j/k scroll · r reply · T details", m.width))
+	footer := "esc back · n/p next/previous thread · j/k scroll · c comment · r resolve · R refresh · T details"
+	if editing {
+		footer = "ctrl+d post · ctrl+k kill line · ctrl+w delete word · ctrl+e end line · esc cancel"
+	}
+	view = append(view, m.visual.footer(footer, m.width))
 	return strings.Join(view, "\n") + "\n"
 }
 
@@ -980,19 +1235,16 @@ func (m Model) editorView() string {
 	if m.editorThreadID != "" {
 		target = "Review-thread reply"
 	}
-	content := appendBodyLines(nil, string(m.editorBuffer), max(20, m.width-6))
+	content, _ := editorDisplayLines(m.editorBuffer, m.editorCursor, max(20, m.width-6))
 	pageSize := max(1, m.height-9)
 	maxScroll := max(0, len(content)-pageSize)
 	start := min(m.editorScroll, maxScroll)
 	end := min(len(content), start+pageSize)
-	lines := []string{m.visual.paint(roleAccent, target), "Type a multiline draft. ctrl+s posts; esc cancels; ↑/↓ scroll.", ""}
+	lines := []string{m.visual.paint(roleAccent, target), "Type a multiline draft. ←/→ moves cursor; ↑/↓ scrolls; ctrl+d posts; ctrl+k kills line; ctrl+w deletes word; ctrl+e ends line; esc cancels.", ""}
 	if start > 0 {
 		lines = append(lines, "↑ earlier draft lines")
 	}
 	lines = append(lines, content[start:end]...)
-	if end == len(content) && end > start {
-		lines[len(lines)-1] += "▏"
-	}
 	if end < len(content) {
 		lines = append(lines, "↓ more draft lines")
 	}

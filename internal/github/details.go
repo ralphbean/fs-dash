@@ -127,6 +127,12 @@ const replyToReviewThreadMutation = `mutation($thread: ID!, $body: String!) {
   }
 }`
 
+const resolveReviewThreadMutation = `mutation($thread: ID!) {
+  resolveReviewThread(input: {threadId: $thread}) {
+    thread { id isResolved }
+  }
+}`
+
 const closePRMutation = `mutation($pullRequest: ID!) {
   closePullRequest(input: {pullRequestId: $pullRequest}) {
     pullRequest { id state closedAt headRefOid }
@@ -435,7 +441,7 @@ func (c DetailClient) FetchDetail(ctx context.Context, key domain.DetailKey) (an
 		if result == nil || result.ID != key.ThreadID {
 			return nil, provenance, &domain.FetchError{Kind: domain.ErrorPermanent, Message: "review thread is no longer available"}
 		}
-		context := domain.ReviewThreadContext{ThreadID: result.ID, Path: result.Path}
+		context := domain.ReviewThreadContext{ThreadID: result.ID, Path: result.Path, IsResolved: result.IsResolved}
 		if result.Line != nil {
 			context.Line = *result.Line
 		}
@@ -614,6 +620,35 @@ func (c DetailClient) ReplyToReviewThread(ctx context.Context, item domain.ItemI
 		return "", &domain.FetchError{Kind: domain.ErrorTransient, Message: "GitHub accepted the reply request without returning a comment ID"}
 	}
 	return result.Reply.ID, nil
+}
+
+func (c DetailClient) ResolveReviewThread(ctx context.Context, item domain.ItemID, threadID string) error {
+	raw, err := c.mutation(ctx, item, resolveReviewThreadMutation, map[string]string{"thread": threadID})
+	if err != nil {
+		return err
+	}
+	var result struct {
+		Thread struct {
+			ID         string `json:"id"`
+			IsResolved bool   `json:"isResolved"`
+		} `json:"thread"`
+	}
+	if err := json.Unmarshal(raw, &result); err != nil || result.Thread.ID != threadID || !result.Thread.IsResolved {
+		return &domain.FetchError{Kind: domain.ErrorTransient, Message: "GitHub did not confirm that the review thread was resolved"}
+	}
+	verified, _, err := c.graphQL(ctx, item, detailThreadContextQuery, map[string]string{"id": threadID}, true, false)
+	if err != nil {
+		issue := fetch.Classify(err)
+		return &domain.FetchError{Kind: issue.Kind, Message: "GitHub could not verify the review-thread resolution", RetryAt: issue.RetryAt, RetryAfter: issue.RetryAfter}
+	}
+	var state struct {
+		ID         string `json:"id"`
+		IsResolved bool   `json:"isResolved"`
+	}
+	if err := json.Unmarshal(verified, &state); err != nil || state.ID != threadID || !state.IsResolved {
+		return &domain.FetchError{Kind: domain.ErrorTransient, Message: "GitHub could not verify the review-thread resolution"}
+	}
+	return nil
 }
 
 func (c DetailClient) MergePR(ctx context.Context, item domain.ItemID, expectedHead string, previous domain.PRActionState) error {

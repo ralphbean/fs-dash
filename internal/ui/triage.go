@@ -1405,6 +1405,9 @@ func (m Model) View() string {
 	if m.mode == "thread" {
 		return m.threadView()
 	}
+	if m.mode == "editor" && m.editorThreadID != "" {
+		return m.threadView()
+	}
 	if m.mode == "editor" {
 		return m.editorView()
 	}

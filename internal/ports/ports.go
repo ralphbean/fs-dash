@@ -33,6 +33,7 @@ type PRActionClient interface {
 	InspectPR(ctx context.Context, item domain.ItemID) (domain.PRActionState, error)
 	PostPRComment(ctx context.Context, item domain.ItemID, body string) (string, error)
 	ReplyToReviewThread(ctx context.Context, item domain.ItemID, threadID, body string) (string, error)
+	ResolveReviewThread(ctx context.Context, item domain.ItemID, threadID string) error
 	MergePR(ctx context.Context, item domain.ItemID, expectedHead string, state domain.PRActionState) error
 	ClosePR(ctx context.Context, item domain.ItemID, expectedHead string) error
 }

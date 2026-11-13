@@ -39,6 +39,9 @@ func (f *detailActionsFake) PostPRComment(context.Context, domain.ItemID, string
 func (f *detailActionsFake) ReplyToReviewThread(context.Context, domain.ItemID, string, string) (string, error) {
 	return f.replyID, f.replyErr
 }
+func (f *detailActionsFake) ResolveReviewThread(context.Context, domain.ItemID, string) error {
+	return nil
+}
 func (f *detailActionsFake) MergePR(context.Context, domain.ItemID, string, domain.PRActionState) error {
 	f.mergeCalls++
 	if f.mergeErr == nil {
@@ -125,7 +128,7 @@ func TestThreadWalkStableOrderAndReplyDraftSurvivesAmbiguousFailure(t *testing.T
 	m.beginEditor("b", "thread")
 	m.editorBuffer = []rune("please change this")
 	m.saveEditorDraft()
-	cmds := m.handleEditorKey(tea.KeyMsg{Type: tea.KeyCtrlS})
+	cmds := m.handleEditorKey(tea.KeyMsg{Type: tea.KeyCtrlD})
 	if len(cmds) != 1 {
 		t.Fatalf("submit commands = %d", len(cmds))
 	}
@@ -149,6 +152,42 @@ func TestThreadWalkStableOrderAndReplyDraftSurvivesAmbiguousFailure(t *testing.T
 	}
 	if !strings.Contains(strings.ToLower(m.status), "not verified") {
 		t.Fatalf("verification outcome not shown: %q", m.status)
+	}
+}
+
+func TestCommentEditorWordAndLineNavigation(t *testing.T) {
+	now := time.Now()
+	pr := testUIPr(23, now)
+	m := loadedModel(t, []domain.PR{pr})
+	m.mode = "editor"
+	m.editorReturnMode = "details"
+	m.editorBuffer = []rune("alpha beta\nthird word")
+	m.editorCursor = len("alpha beta")
+	m.saveEditorDraft()
+
+	steps := []struct {
+		key      tea.KeyType
+		wantPos  int
+		keyLabel string
+	}{
+		{tea.KeyCtrlLeft, 6, "ctrl+left to the previous word"},
+		{tea.KeyCtrlLeft, 0, "ctrl+left to the start"},
+		{tea.KeyCtrlRight, 6, "ctrl+right to the next word"},
+		{tea.KeyCtrlRight, 11, "ctrl+right across a line break"},
+		{tea.KeyCtrlRight, 17, "ctrl+right past the next word"},
+		{tea.KeyCtrlA, 11, "ctrl+a to the current line start"},
+	}
+	for _, step := range steps {
+		m.handleEditorKey(tea.KeyMsg{Type: step.key})
+		if m.editorCursor != step.wantPos {
+			t.Fatalf("%s moved cursor to %d, want %d", step.keyLabel, m.editorCursor, step.wantPos)
+		}
+	}
+	if string(m.editorBuffer) != "alpha beta\nthird word" {
+		t.Fatalf("navigation changed the draft: %q", string(m.editorBuffer))
+	}
+	if !strings.Contains(m.View(), "▏third word") {
+		t.Fatalf("caret is not visible at the line start: %s", m.View())
 	}
 }
 

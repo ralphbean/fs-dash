@@ -98,6 +98,7 @@ type ReviewThreadContext struct {
 	OriginalLine int
 	DiffHunk     string
 	IsOutdated   bool
+	IsResolved   bool
 }
 
 type PRActionState struct {
