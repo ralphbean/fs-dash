@@ -97,6 +97,9 @@ type Model struct {
 	wakeTickRunning                 bool
 	wakeGeneration                  uint64
 	nextWake                        time.Time
+	freshnessTickRunning            bool
+	freshnessGeneration             uint64
+	nextFreshnessRefresh            time.Time
 	activityQueue                   []domain.FieldKey
 	activityQueued                  map[domain.FieldKey]bool
 	activityQueueTokens             []uint64
@@ -137,6 +140,7 @@ type listMsg struct {
 	at         time.Time
 	attempt    int
 	duration   time.Duration
+	quiet      bool
 }
 type fieldMsg struct {
 	key        domain.FieldKey
@@ -171,6 +175,7 @@ type wakeMsg struct{ generation uint64 }
 type fieldOffscreenWakeMsg struct{ generation uint64 }
 type activityOffscreenWakeMsg struct{ generation uint64 }
 type quotaTickMsg struct{ generation uint64 }
+type freshnessRefreshMsg struct{ generation uint64 }
 type commandMsg struct {
 	key string
 	err error
@@ -381,6 +386,9 @@ func (m Model) Init() tea.Cmd {
 	return tea.Batch(cmds...)
 }
 func (m Model) fetchList(repo string, generation uint64, attempt int) tea.Cmd {
+	return m.fetchListWithStatus(repo, generation, attempt, false)
+}
+func (m Model) fetchListWithStatus(repo string, generation uint64, attempt int, quiet bool) tea.Cmd {
 	return func() tea.Msg {
 		start := m.opts.Clock.Now()
 		value, err := m.opts.Scheduler.Do(context.Background(), "github", fmt.Sprintf("list:%s:%d", repo, generation), func(ctx context.Context) (any, error) { return m.opts.Lister.ListOpenPRs(ctx, repo) })
@@ -392,7 +400,7 @@ func (m Model) fetchList(repo string, generation uint64, attempt int) tea.Cmd {
 			prs, viewer, quota = result.PullRequests, result.ViewerLogin, result.Quota
 		}
 		at := m.opts.Clock.Now()
-		return listMsg{repo: repo, generation: generation, value: prs, viewer: viewer, quota: quota, err: err, at: at, attempt: attempt, duration: at.Sub(start)}
+		return listMsg{repo: repo, generation: generation, value: prs, viewer: viewer, quota: quota, err: err, at: at, attempt: attempt, duration: at.Sub(start), quiet: quiet}
 	}
 }
 func (m Model) fetchField(key domain.FieldKey, generation uint64, attempt int) tea.Cmd {
@@ -662,6 +670,12 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.generation == m.quotaGeneration {
 			cmds = append(cmds, m.quotaRefreshCmd())
 		}
+	case freshnessRefreshMsg:
+		if msg.generation == m.freshnessGeneration {
+			m.freshnessTickRunning = false
+			m.nextFreshnessRefresh = time.Time{}
+			cmds = append(cmds, m.refreshDueListData()...)
+		}
 	case listMsg:
 		if m.observeQuota(msg.quota) {
 			cmds = append(cmds, m.quotaRefreshCmd())
@@ -688,7 +702,9 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			s.field.Succeed(msg.generation, msg.value, domain.Provenance{Source: "github", FetchedAt: msg.at, Version: msg.at.Format(time.RFC3339Nano), FreshUntil: msg.at.Add(2 * time.Minute)})
 			s.attempts = 0
 			m.log("info", "list-open-prs", msg.repo, msg.attempt, msg.duration, fmt.Sprintf("loaded %d open PRs", len(msg.value)))
-			m.status = fmt.Sprintf("%s: %d open PRs", msg.repo, len(msg.value))
+			if !msg.quiet {
+				m.status = fmt.Sprintf("%s: %d open PRs", msg.repo, len(msg.value))
+			}
 			if msg.viewer != "" {
 				m.viewer = msg.viewer
 			}
@@ -934,6 +950,9 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 	}
 	if wake := m.scheduleWake(); wake != nil {
 		cmds = append(cmds, wake)
+	}
+	if refresh := m.scheduleFreshnessRefresh(); refresh != nil {
+		cmds = append(cmds, refresh)
 	}
 	m.maybeTick(&cmds)
 	m.maybeRunClockTick(&cmds)
