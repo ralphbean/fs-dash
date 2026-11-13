@@ -180,26 +180,13 @@ func (m Model) projection() triage.Sections {
 	now := m.opts.Clock.Now()
 	reminders := m.opts.Reminders.Snapshot()
 	var inputs []triage.Input
-	seen := make(map[domain.ItemID]bool)
 	for _, section := range m.sections {
 		if !section.field.HasValue {
 			continue
 		}
 		for _, pr := range section.field.Value {
-			seen[pr.ID] = true
 			inputs = append(inputs, m.triageInput(pr, reminders[pr.ID]))
 		}
-	}
-	for id, entry := range reminders {
-		if seen[id] || entry.SnoozedUntil.IsZero() {
-			continue
-		}
-		host := id.Host
-		if host == "" {
-			host = "github.com"
-		}
-		pr := domain.PR{ID: id, Title: "No longer open in the current list", URL: fmt.Sprintf("https://%s/%s/pull/%d", host, id.Repo, id.Number)}
-		inputs = append(inputs, m.triageInput(pr, entry))
 	}
 	return triage.Project(inputs, m.filter, now)
 }
