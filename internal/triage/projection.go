@@ -67,16 +67,18 @@ func (f Filter) Label() string {
 }
 
 type Input struct {
-	PR            domain.PR
-	Assigned      domain.DerivedBool
-	ReviewRequest domain.DerivedBool
-	AuthoredByMe  domain.DerivedBool
-	Checks        domain.CheckSummary
-	Threads       domain.ThreadSummary
-	BotApproval   domain.DerivedBool
-	Activity      domain.ActivityEvidence
-	Starred       bool
-	SnoozedUntil  time.Time
+	PR                domain.PR
+	ViewerLogin       string
+	LastHumanActivity domain.LastHumanActivity
+	Assigned          domain.DerivedBool
+	ReviewRequest     domain.DerivedBool
+	AuthoredByMe      domain.DerivedBool
+	Checks            domain.CheckSummary
+	Threads           domain.ThreadSummary
+	BotApproval       domain.DerivedBool
+	Activity          domain.ActivityEvidence
+	Starred           bool
+	SnoozedUntil      time.Time
 }
 
 type Reason struct {
@@ -95,9 +97,11 @@ type Row struct {
 }
 
 type Sections struct {
-	Review  []Row
-	Active  []Row
-	Snoozed []Row
+	Default         []Row
+	LastTouchedByMe []Row
+	Active          []Row
+	Drafts          []Row
+	Snoozed         []Row
 }
 
 const staleAfter = 7 * 24 * time.Hour
@@ -120,14 +124,21 @@ func Project(inputs []Input, filter Filter, now time.Time) Sections {
 			continue
 		}
 		row := makeRow(in, now, pending)
-		if in.Activity.State == domain.ActivityActive {
+		switch {
+		case in.PR.IsDraft:
+			out.Drafts = append(out.Drafts, row)
+		case in.Activity.State == domain.ActivityActive:
 			out.Active = append(out.Active, row)
-		} else {
-			out.Review = append(out.Review, row)
+		case in.LastHumanActivity.Complete && in.ViewerLogin != "" && strings.EqualFold(in.LastHumanActivity.Actor, in.ViewerLogin):
+			out.LastTouchedByMe = append(out.LastTouchedByMe, row)
+		default:
+			out.Default = append(out.Default, row)
 		}
 	}
-	sortRows(out.Review)
+	sortRows(out.Default)
+	sortRows(out.LastTouchedByMe)
 	sortRows(out.Active)
+	sortRows(out.Drafts)
 	sort.Slice(out.Snoozed, func(i, j int) bool {
 		if !out.Snoozed[i].SnoozedUntil.Equal(out.Snoozed[j].SnoozedUntil) {
 			return out.Snoozed[i].SnoozedUntil.Before(out.Snoozed[j].SnoozedUntil)

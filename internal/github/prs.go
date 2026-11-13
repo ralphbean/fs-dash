@@ -23,7 +23,7 @@ const listQuery = `query($owner: String!, $name: String!, $endCursor: String) {
   viewer { login }
   repository(owner: $owner, name: $name) {
     pullRequests(first: 100, after: $endCursor, states: OPEN, orderBy: {field: UPDATED_AT, direction: DESC}) {
-      nodes { number title url updatedAt headRefOid author { login } assignees(first: 20) { nodes { login } pageInfo { hasNextPage } } }
+      nodes { number title url updatedAt headRefOid isDraft author { login } assignees(first: 20) { nodes { login } pageInfo { hasNextPage } } }
       pageInfo { hasNextPage endCursor }
     }
   }
@@ -42,6 +42,7 @@ type page struct {
 					URL       string    `json:"url"`
 					UpdatedAt time.Time `json:"updatedAt"`
 					HeadSHA   string    `json:"headRefOid"`
+					IsDraft   bool      `json:"isDraft"`
 					Author    *struct {
 						Login string `json:"login"`
 					} `json:"author"`
@@ -136,7 +137,7 @@ func (l PRLister) ListOpenPRs(ctx context.Context, repository string) (domain.PR
 				}
 				assignees.Complete = !node.Assignees.PageInfo.HasNextPage
 			}
-			result.PullRequests = append(result.PullRequests, domain.PR{ID: domain.ItemID{Source: "github", Host: "github.com", Repo: repository, Number: node.Number}, Title: node.Title, URL: node.URL, UpdatedAt: node.UpdatedAt, HeadSHA: node.HeadSHA, Author: author, Assignees: assignees})
+			result.PullRequests = append(result.PullRequests, domain.PR{ID: domain.ItemID{Source: "github", Host: "github.com", Repo: repository, Number: node.Number}, Title: node.Title, URL: node.URL, UpdatedAt: node.UpdatedAt, HeadSHA: node.HeadSHA, Author: author, IsDraft: node.IsDraft, Assignees: assignees})
 		}
 		pullRequests := response.Data.Repository.PullRequests
 		if !pullRequests.PageInfo.HasNextPage {

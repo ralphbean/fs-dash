@@ -122,7 +122,7 @@ func TestActiveRunTreeRendersAndAdvancesWithoutFetching(t *testing.T) {
 	if m.runClockTickRunning {
 		t.Fatal("clock kept ticking after the active-agent section disappeared")
 	}
-	if got := ansi.Strip(m.View()); strings.Contains(got, "ACTIVE FULLSEND AGENTS") || strings.Contains(got, "run-code") {
-		t.Fatalf("completed runs remained in the active section: %s", got)
+	if got := ansi.Strip(m.View()); strings.Contains(got, "ACTIVE FULLSEND AGENTS") || strings.Contains(got, "No PRs in this section.") || strings.Contains(got, "run-code") {
+		t.Fatalf("empty active section remained visible: %s", got)
 	}
 }

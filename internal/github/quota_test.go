@@ -121,7 +121,7 @@ func TestRateLimitMetadataHonorsRetryAfterAndPrimaryReset(t *testing.T) {
 func TestPRListerCollectsConservativeQuotaAcrossPages(t *testing.T) {
 	reset := time.Now().Add(30 * time.Minute).Truncate(time.Second)
 	first := responseWithQuota("200 OK", 5000, 120, 4880, reset,
-		`{"data":{"viewer":{"login":"me"},"repository":{"pullRequests":{"nodes":[{"number":1,"title":"First","url":"https://github.com/o/r/pull/1","updatedAt":"2026-11-06T16:00:00Z","headRefOid":"head-1","author":{"login":"one"},"assignees":{"nodes":[],"pageInfo":{"hasNextPage":false}}}],"pageInfo":{"hasNextPage":true,"endCursor":"cursor-1"}}}}}`)
+		`{"data":{"viewer":{"login":"me"},"repository":{"pullRequests":{"nodes":[{"number":1,"title":"First","url":"https://github.com/o/r/pull/1","updatedAt":"2026-11-06T16:00:00Z","headRefOid":"head-1","isDraft":true,"author":{"login":"one"},"assignees":{"nodes":[],"pageInfo":{"hasNextPage":false}}}],"pageInfo":{"hasNextPage":true,"endCursor":"cursor-1"}}}}}`)
 	second := responseWithQuota("200 OK", 5000, 121, 4879, reset,
 		`{"data":{"viewer":{"login":"me"},"repository":{"pullRequests":{"nodes":[{"number":2,"title":"Second","url":"https://github.com/o/r/pull/2","updatedAt":"2026-11-06T15:00:00Z","headRefOid":"head-2","author":{"login":"two"},"assignees":{"nodes":[],"pageInfo":{"hasNextPage":false}}}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}`)
 
@@ -131,6 +131,9 @@ func TestPRListerCollectsConservativeQuotaAcrossPages(t *testing.T) {
 	}
 	if len(got.PullRequests) != 2 || got.ViewerLogin != "me" {
 		t.Fatalf("PR list = %+v", got)
+	}
+	if !got.PullRequests[0].IsDraft || got.PullRequests[1].IsDraft {
+		t.Fatalf("draft state was not decoded from list rows: %+v", got.PullRequests)
 	}
 	if got.Quota == nil || got.Quota.Remaining != 4879 || got.Quota.Used != 121 || !got.Quota.ResetAt.Equal(reset) {
 		t.Fatalf("pagination did not retain the most conservative quota observation: %+v", got.Quota)

@@ -15,7 +15,7 @@ import (
 	"github.com/fullsend-ai/fs-dash/internal/triage"
 )
 
-var triageFieldNames = []string{"reviews", "review_requests", "assignees", "checks", "review_threads", "last_touched", "activity"}
+var triageFieldNames = []string{"reviews", "review_requests", "assignees", "checks", "review_threads", "last_touched", "last_human_touch", "activity"}
 
 const maxConcurrentActivityFetches = 5
 const maxConcurrentFieldFetches = 2
@@ -24,7 +24,7 @@ const offscreenFieldPace = 500 * time.Millisecond
 const offscreenActivityPace = 750 * time.Millisecond
 const queueContinuationDelay = 5 * time.Millisecond
 
-var tableSummaryFieldNames = []string{"last_touched", "checks", "reviews", "review_threads", "assignees"}
+var tableSummaryFieldNames = []string{"last_touched", "last_human_touch", "checks", "reviews", "review_threads", "assignees"}
 
 type prRevision struct {
 	item     domain.ItemID
@@ -84,7 +84,7 @@ func selectedPRFromSections(sections triage.Sections, id domain.ItemID) (domain.
 }
 
 func selectedRowFromSections(sections triage.Sections, id domain.ItemID) (triage.Row, bool) {
-	for _, rows := range [][]triage.Row{sections.Review, sections.Active, sections.Snoozed} {
+	for _, rows := range [][]triage.Row{sections.Default, sections.LastTouchedByMe, sections.Active, sections.Drafts, sections.Snoozed} {
 		for _, row := range rows {
 			if row.PR.ID == id {
 				return row, true
@@ -205,7 +205,7 @@ func (m Model) projection() triage.Sections {
 }
 
 func (m Model) triageInput(pr domain.PR, saved reminder.Entry) triage.Input {
-	in := triage.Input{PR: pr, Starred: saved.Starred, SnoozedUntil: saved.SnoozedUntil}
+	in := triage.Input{PR: pr, Starred: saved.Starred, SnoozedUntil: saved.SnoozedUntil, ViewerLogin: m.viewer}
 	in.AuthoredByMe = authorSignal(pr.Author, m.viewer)
 	if f := m.freshField(pr, "review_requests"); f != nil {
 		if requests, ok := f.Value.(domain.LoginSet); ok {
@@ -228,6 +228,11 @@ func (m Model) triageInput(pr domain.PR, saved reminder.Entry) triage.Input {
 	if f := m.freshField(pr, "review_threads"); f != nil {
 		if threads, ok := f.Value.(domain.ThreadSummary); ok {
 			in.Threads = threads
+		}
+	}
+	if f := m.freshField(pr, "last_human_touch"); f != nil {
+		if activity, ok := f.Value.(domain.LastHumanActivity); ok {
+			in.LastHumanActivity = activity
 		}
 	}
 	if f := m.freshField(pr, "reviews"); f != nil {
@@ -306,11 +311,17 @@ func listAssignmentSignal(pr domain.PR, viewer string) domain.DerivedBool {
 
 func (m Model) projectedRows() []domain.PR {
 	sections := m.projection()
-	rows := make([]domain.PR, 0, len(sections.Review)+len(sections.Active)+len(sections.Snoozed))
-	for _, row := range sections.Review {
+	rows := make([]domain.PR, 0, len(sections.Default)+len(sections.LastTouchedByMe)+len(sections.Active)+len(sections.Drafts)+len(sections.Snoozed))
+	for _, row := range sections.Default {
+		rows = append(rows, row.PR)
+	}
+	for _, row := range sections.LastTouchedByMe {
 		rows = append(rows, row.PR)
 	}
 	for _, row := range sections.Active {
+		rows = append(rows, row.PR)
+	}
+	for _, row := range sections.Drafts {
 		rows = append(rows, row.PR)
 	}
 	for _, row := range sections.Snoozed {
@@ -415,43 +426,8 @@ func (m Model) visibleRowsForPrefetch() []domain.PR {
 }
 
 func (m Model) visibleRowsForPrefetchFrom(sections triage.Sections) []domain.PR {
-	type rowPosition struct {
-		pr   domain.PR
-		line int
-	}
-	var positioned []rowPosition
-	selectedLine := -1
-	contentLine := 0
-	if m.showingSnoozed() {
-		contentLine = 1 // Table header.
-		for _, row := range sections.Snoozed {
-			if row.PR.ID == m.selected {
-				selectedLine = contentLine
-			}
-			positioned = append(positioned, rowPosition{pr: row.PR, line: contentLine})
-			contentLine++
-		}
-	} else {
-		contentLine = 2 + len(m.sections) // Review heading, repository summaries, table header.
-		for _, row := range sections.Review {
-			if row.PR.ID == m.selected {
-				selectedLine = contentLine
-			}
-			positioned = append(positioned, rowPosition{pr: row.PR, line: contentLine})
-			contentLine++
-		}
-		if len(sections.Active) > 0 {
-			contentLine += 2 // Active heading and repeated table header.
-			for _, row := range sections.Active {
-				if row.PR.ID == m.selected {
-					selectedLine = contentLine
-				}
-				positioned = append(positioned, rowPosition{pr: row.PR, line: contentLine})
-				contentLine++
-			}
-		}
-	}
-	if len(positioned) == 0 {
+	content, selectedLine := m.listContent(sections)
+	if len(content) == 0 {
 		return nil
 	}
 	scope := "no repository configured"
@@ -461,28 +437,7 @@ func (m Model) visibleRowsForPrefetchFrom(sections triage.Sections) []domain.PR 
 	lineCount := len(m.visual.header("fs-dash · Pull requests", scope, m.width)) + 1
 	selected, hasSelected := selectedPRFromSections(sections, m.selected)
 	if hasSelected {
-		var selectedRow triage.Row
-		if m.showingSnoozed() {
-			for _, row := range sections.Snoozed {
-				if row.PR.ID == selected.ID {
-					selectedRow = row
-					break
-				}
-			}
-		} else {
-			for _, row := range sections.Review {
-				if row.PR.ID == selected.ID {
-					selectedRow = row
-					break
-				}
-			}
-			for _, row := range sections.Active {
-				if row.PR.ID == selected.ID {
-					selectedRow = row
-					break
-				}
-			}
-		}
+		selectedRow, _ := selectedRowFromSections(sections, m.selected)
 		lineCount += len(m.selectedContext(selected, selectedRow))
 	}
 	statusLines := 0
@@ -496,15 +451,15 @@ func (m Model) visibleRowsForPrefetchFrom(sections triage.Sections) []domain.PR 
 	start := 0
 	if selectedLine >= 0 {
 		start = max(0, selectedLine-available/2)
-		if start+available > contentLine {
-			start = max(0, contentLine-available)
+		if start+available > len(content) {
+			start = max(0, len(content)-available)
 		}
 	}
-	end := min(contentLine, start+available)
+	end := min(len(content), start+available)
 	visible := make([]domain.PR, 0, end-start)
-	for _, row := range positioned {
-		if row.line >= start && row.line < end {
-			visible = append(visible, row.pr)
+	for _, line := range content[start:end] {
+		if line.kind == listContentPR {
+			visible = append(visible, line.row.PR)
 		}
 	}
 	return visible
@@ -867,7 +822,7 @@ func (m *Model) processListPrefetchChunk() tea.Cmd {
 		pr := batch.prs[m.prefetchPRIndex]
 		m.prefetchPRIndex++
 		processed++
-		for _, name := range []string{"last_touched", "checks", "reviews", "review_threads"} {
+		for _, name := range []string{"last_touched", "last_human_touch", "checks", "reviews", "review_threads"} {
 			m.queueField(domain.FieldKey{Item: pr.ID, Name: name, Revision: pr.HeadSHA}, false)
 		}
 		if !pr.Assignees.Complete {
@@ -1171,26 +1126,11 @@ type listContentLine struct {
 	lastRun bool
 }
 
-func (m Model) listView() string {
-	sections := m.projection()
-	scope := "no repository configured"
-	if len(m.opts.Repos) > 0 {
-		scope = strings.Join(m.opts.Repos, ", ")
-	}
-	lines := m.visual.header("fs-dash · Pull requests", scope, m.width)
-	lines = append(lines, m.filterTabs())
-	rowCount := len(sections.Review) + len(sections.Active)
-	if m.showingSnoozed() {
-		rowCount = len(sections.Snoozed)
-	}
-	content := make([]listContentLine, 0, rowCount+len(m.sections)+8)
+func (m Model) listContent(sections triage.Sections) ([]listContentLine, int) {
+	content := make([]listContentLine, 0, len(sections.Default)+len(sections.LastTouchedByMe)+len(sections.Active)+len(sections.Drafts)+len(sections.Snoozed)+len(m.sections)+12)
 	appendText := func(text string) { content = append(content, listContentLine{kind: listContentText, text: text}) }
 	appendHeader := func() { content = append(content, listContentLine{kind: listContentTableHeader}) }
 	appendPR := func(row triage.Row) { content = append(content, listContentLine{kind: listContentPR, row: row}) }
-	appendRun := func(run domain.ActivityRun, last bool) {
-		content = append(content, listContentLine{kind: listContentActivityRun, run: run, lastRun: last})
-	}
-	appendRunNotice := func() { content = append(content, listContentLine{kind: listContentActivityNotice}) }
 	selectedLine := -1
 	if m.showingSnoozed() {
 		appendHeader()
@@ -1200,45 +1140,67 @@ func (m Model) listView() string {
 			}
 			appendPR(row)
 		}
+		if len(sections.Snoozed) == 0 {
+			appendText(m.visual.paint(roleMuted, "No PRs are currently snoozed."))
+		}
 	} else {
-		appendText(m.visual.paint(roleAccent, "REVIEW"))
-		if summaries := m.repositorySummaryLine(sections); summaries != "" {
-			appendText(summaries)
+		type displaySection struct {
+			title string
+			rows  []triage.Row
 		}
-		appendHeader()
-		for _, row := range sections.Review {
-			if row.PR.ID == m.selected {
-				selectedLine = len(content)
+		ordered := []displaySection{
+			{title: "DEFAULT", rows: sections.Default},
+			{title: "LAST TOUCHED BY ME", rows: sections.LastTouchedByMe},
+			{title: "ACTIVE FULLSEND AGENTS", rows: sections.Active},
+			{title: "DRAFTS", rows: sections.Drafts},
+		}
+		firstDisplayed := true
+		for i, section := range ordered {
+			if len(section.rows) == 0 {
+				continue
 			}
-			appendPR(row)
-		}
-		if len(sections.Active) > 0 {
-			appendText(m.visual.paint(roleAccent, "ACTIVE FULLSEND AGENTS"))
+			if !firstDisplayed {
+				appendText("")
+			}
+			appendText(m.visual.paint(roleAccent, section.title))
+			if firstDisplayed {
+				firstDisplayed = false
+				if summaries := m.repositorySummaryLine(sections); summaries != "" {
+					appendText(summaries)
+				}
+			}
 			appendHeader()
-			for _, row := range sections.Active {
+			for _, row := range section.rows {
 				if row.PR.ID == m.selected {
 					selectedLine = len(content)
 				}
 				appendPR(row)
-				for i, run := range row.Activity.Runs {
-					appendRun(run, i == len(row.Activity.Runs)-1 && row.Activity.RunsComplete)
-				}
-				if !row.Activity.RunsComplete {
-					appendRunNotice()
+				if i == 2 {
+					for runIndex, run := range row.Activity.Runs {
+						content = append(content, listContentLine{kind: listContentActivityRun, run: run, lastRun: runIndex == len(row.Activity.Runs)-1 && row.Activity.RunsComplete})
+					}
+					if !row.Activity.RunsComplete {
+						content = append(content, listContentLine{kind: listContentActivityNotice})
+					}
 				}
 			}
-		}
-	}
-	if rowCount == 0 {
-		if m.showingSnoozed() {
-			appendText(m.visual.paint(roleMuted, "No PRs are currently snoozed."))
-		} else {
-			appendText(m.visual.paint(roleMuted, "No PRs match this filter. Pending filter data remains visible when its result is unknown."))
 		}
 	}
 	if len(m.opts.Repos) == 0 {
 		appendText(m.visual.paint(roleMuted, "No GitHub repository found. Add repositories = [\"owner/name\"] to config.toml or run from a GitHub checkout."))
 	}
+	return content, selectedLine
+}
+
+func (m Model) listView() string {
+	sections := m.projection()
+	scope := "no repository configured"
+	if len(m.opts.Repos) > 0 {
+		scope = strings.Join(m.opts.Repos, ", ")
+	}
+	lines := m.visual.header("fs-dash · Pull requests", scope, m.width)
+	lines = append(lines, m.filterTabs())
+	content, selectedLine := m.listContent(sections)
 	selectedRow, hasSelected := selectedRowFromSections(sections, m.selected)
 	var context []string
 	if hasSelected {
@@ -1550,7 +1512,7 @@ func (m Model) rowStatus(row triage.Row) string {
 	}
 	if !m.showingSnoozed() {
 		for _, name := range triageFieldNames {
-			if name == "activity" {
+			if name == "activity" || name == "last_human_touch" {
 				continue
 			}
 			field := m.fieldFor(row.PR, name)
@@ -1558,6 +1520,19 @@ func (m Model) rowStatus(row triage.Row) string {
 				parts = append(parts, name+" failed")
 			} else if field != nil && field.Stale(m.opts.Clock.Now()) {
 				parts = append(parts, name+" stale")
+			}
+		}
+		humanTouch := m.fieldFor(row.PR, "last_human_touch")
+		switch {
+		case humanTouch == nil || humanTouch.Phase.Active():
+			parts = append(parts, "last human activity pending")
+		case humanTouch.Phase == domain.Failed || humanTouch.Phase == domain.Cooldown:
+			parts = append(parts, "last human activity unavailable")
+		case humanTouch.Stale(m.opts.Clock.Now()):
+			parts = append(parts, "last human activity stale")
+		case humanTouch.HasValue:
+			if activity, ok := humanTouch.Value.(domain.LastHumanActivity); ok && !activity.Complete {
+				parts = append(parts, "last human activity incomplete")
 			}
 		}
 		field := m.fieldFor(row.PR, "activity")

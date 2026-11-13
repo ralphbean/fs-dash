@@ -272,7 +272,7 @@ func TestRepositorySummariesShareOneHorizontalRow(t *testing.T) {
 	now := time.Now()
 	repos := []string{"alpha/one", "bravo/two", "charlie/three"}
 	m := New(Options{Config: config.Default(), Repos: repos})
-	m.width, m.height, m.viewer = 260, 32, "me"
+	m.width, m.height, m.viewer, m.filter = 260, 32, "me", triage.FilterAll
 	for i, repo := range repos {
 		pr := testUIPr(i+1, now)
 		pr.ID.Repo = repo
@@ -288,19 +288,19 @@ func TestRepositorySummariesShareOneHorizontalRow(t *testing.T) {
 		m.visual.compact = width < 64
 		view := m.View()
 		lines := strings.Split(strings.TrimSuffix(ansi.Strip(view), "\n"), "\n")
-		reviewLine, tableHeaderLine := -1, -1
+		defaultLine, tableHeaderLine := -1, -1
 		for i, line := range lines {
-			if strings.Contains(line, "REVIEW") {
-				reviewLine = i
+			if strings.Contains(line, "DEFAULT") {
+				defaultLine = i
 			}
-			if strings.Contains(line, "PR") && strings.Contains(line, "Title") {
+			if tableHeaderLine < 0 && strings.Contains(line, "PR") && strings.Contains(line, "Title") {
 				tableHeaderLine = i
 			}
 		}
-		if reviewLine < 0 || tableHeaderLine != reviewLine+2 {
+		if defaultLine < 0 || tableHeaderLine != defaultLine+2 {
 			t.Fatalf("repository summaries did not occupy exactly one row above the table at width %d: %s", width, view)
 		}
-		return lines[reviewLine+1], strings.Split(strings.TrimSuffix(view, "\n"), "\n")
+		return lines[defaultLine+1], strings.Split(strings.TrimSuffix(view, "\n"), "\n")
 	}
 
 	wideSummary, _ := assertSummaryRow(260)
@@ -344,7 +344,7 @@ func TestBackgroundSummaryPrefetchIsBoundedAndDoesNotDelayList(t *testing.T) {
 		t.Fatalf("activity concurrency = %d, exceeds cap %d", got, maxConcurrentActivityFetches)
 	}
 	last := prs[len(prs)-1]
-	for _, name := range []string{"checks", "reviews", "review_threads"} {
+	for _, name := range []string{"last_human_touch", "checks", "reviews", "review_threads"} {
 		key := domain.FieldKey{Item: last.ID, Name: name, Revision: last.HeadSHA}
 		if !m.fieldQueued[key] {
 			t.Errorf("off-screen PR summary %q was not queued", name)
@@ -489,8 +489,8 @@ func TestReviewFilterIncludesIncompleteRowsAsPending(t *testing.T) {
 	m.filter = triage.FilterReviewRequested
 	m.ensureSelection()
 	sections := m.projection()
-	if len(sections.Review) != 2 || sections.Review[0].PR.ID.Number != 2 || sections.Review[1].PR.ID.Number != 3 || !sections.Review[1].FilterPending {
-		t.Fatalf("review filter rows = %+v", sections.Review)
+	if len(sections.Default) != 2 || sections.Default[0].PR.ID.Number != 2 || sections.Default[1].PR.ID.Number != 3 || !sections.Default[1].FilterPending {
+		t.Fatalf("review filter rows = %+v", sections.Default)
 	}
 	view := m.View()
 	if !strings.Contains(view, "Review req") || !strings.Contains(view, "1 pending") {
@@ -520,13 +520,49 @@ func TestActivitySectionAndSelectionSurviveRankingUpdate(t *testing.T) {
 	active := domain.ActivityEvidence{State: domain.ActivityActive, Author: "fullsend-ai-coder", RunID: "run-3", StartedAt: now, URL: "https://github.com/owner/repo/pull/1#issuecomment-3", FetchedAt: now, FreshUntil: now.Add(time.Hour), Complete: true}
 	putField(&m, prs[0], "activity", active, now)
 	sections := m.projection()
-	if len(sections.Active) != 1 || sections.Active[0].PR.ID.Number != 1 || len(sections.Review) != 1 || sections.Review[0].PR.ID.Number != 2 {
-		t.Fatalf("active-agent section = %+v; review = %+v", sections.Active, sections.Review)
+	if len(sections.Active) != 1 || sections.Active[0].PR.ID.Number != 1 || len(sections.Default) != 1 || sections.Default[0].PR.ID.Number != 2 {
+		t.Fatalf("active-agent section = %+v; default = %+v", sections.Active, sections.Default)
 	}
 	m.selected = prs[0].ID
 	m.ensureSelection()
 	if view := m.View(); !strings.Contains(view, "ACTIVE FULLSEND AGENTS") || !strings.Contains(view, active.URL) {
 		t.Fatalf("active evidence absent from view: %s", view)
+	}
+}
+
+func TestFourPRSectionsUsePrecedenceAndKeepSelectionOnMove(t *testing.T) {
+	now := time.Date(2026, 11, 6, 12, 0, 0, 0, time.UTC)
+	prs := []domain.PR{testUIPr(81, now), testUIPr(82, now), testUIPr(83, now), testUIPr(84, now)}
+	prs[3].IsDraft = true
+	m := loadedModel(t, prs)
+	m.width, m.height, m.viewer, m.filter = 180, 45, "me", triage.FilterAll
+	m.opts.Clock = &testClock{now: now}
+	for _, pr := range prs[1:] {
+		putField(&m, pr, "last_human_touch", domain.LastHumanActivity{Actor: "me", Complete: true}, now)
+	}
+	putField(&m, prs[2], "activity", domain.ActivityEvidence{State: domain.ActivityActive, Complete: true, RunsComplete: true}, now)
+	putField(&m, prs[3], "activity", domain.ActivityEvidence{State: domain.ActivityActive, Complete: true, RunsComplete: true}, now)
+	m.selected, m.hasSelection = prs[1].ID, true
+
+	sections := m.projection()
+	if len(sections.Default) != 1 || sections.Default[0].PR.ID != prs[0].ID || len(sections.LastTouchedByMe) != 1 || sections.LastTouchedByMe[0].PR.ID != prs[1].ID || len(sections.Active) != 1 || sections.Active[0].PR.ID != prs[2].ID || len(sections.Drafts) != 1 || sections.Drafts[0].PR.ID != prs[3].ID {
+		t.Fatalf("four-section precedence = default:%v last:%v active:%v drafts:%v", sections.Default, sections.LastTouchedByMe, sections.Active, sections.Drafts)
+	}
+	view := ansi.Strip(m.View())
+	positions := []int{strings.Index(view, "DEFAULT"), strings.Index(view, "LAST TOUCHED BY ME"), strings.Index(view, "ACTIVE FULLSEND AGENTS"), strings.Index(view, "DRAFTS")}
+	for i, position := range positions {
+		if position < 0 || (i > 0 && position <= positions[i-1]) {
+			t.Fatalf("section headings are missing or out of order: %v\n%s", positions, view)
+		}
+	}
+
+	putField(&m, prs[1], "activity", domain.ActivityEvidence{State: domain.ActivityActive, Complete: true, RunsComplete: true}, now)
+	m.ensureSelection()
+	if m.selected != prs[1].ID {
+		t.Fatalf("selection changed when PR moved sections: got %v, want %v", m.selected, prs[1].ID)
+	}
+	if sections := m.projection(); len(sections.LastTouchedByMe) != 0 || len(sections.Active) != 2 {
+		t.Fatalf("updated precedence = last:%v active:%v", sections.LastTouchedByMe, sections.Active)
 	}
 }
 
@@ -712,7 +748,7 @@ func TestActivityIndicatorsSeparatePendingInactiveStaleAndFailed(t *testing.T) {
 	now := time.Now()
 	pr := testUIPr(14, now)
 	m := loadedModel(t, []domain.PR{pr})
-	if got := m.rowStatus(m.projection().Review[0]); !strings.Contains(got, "activity pending") {
+	if got := m.rowStatus(m.projection().Default[0]); !strings.Contains(got, "activity pending") {
 		t.Fatalf("unrequested activity indicator = %q", got)
 	}
 	for _, tc := range []struct {
@@ -720,7 +756,7 @@ func TestActivityIndicatorsSeparatePendingInactiveStaleAndFailed(t *testing.T) {
 		want  string
 	}{{domain.ActivityUnknown, "activity unknown"}, {domain.ActivityInactive, "agent inactive"}, {domain.ActivityStale, "agent status stale"}} {
 		putField(&m, pr, "activity", domain.ActivityEvidence{State: tc.state, StartedAt: now.Add(-7 * time.Hour)}, now)
-		row := m.projection().Review[0]
+		row := m.projection().Default[0]
 		if got := m.rowStatus(row); !strings.Contains(got, tc.want) {
 			t.Errorf("%s indicator = %q, want %q", tc.state, got, tc.want)
 		}
@@ -731,7 +767,7 @@ func TestActivityIndicatorsSeparatePendingInactiveStaleAndFailed(t *testing.T) {
 	f.Begin(generation)
 	f.Fail(generation, &domain.FetchError{Kind: domain.ErrorPermanent, Message: "comment query failed"}, time.Time{})
 	m.fields[key] = &f
-	if got := m.rowStatus(m.projection().Review[0]); !strings.Contains(got, "activity failed") {
+	if got := m.rowStatus(m.projection().Default[0]); !strings.Contains(got, "activity failed") {
 		t.Fatalf("failed activity indicator = %q", got)
 	}
 }

@@ -23,6 +23,7 @@ type PR struct {
 	ID        ItemID
 	Title     string
 	Author    string
+	IsDraft   bool
 	UpdatedAt time.Time
 	URL       string
 	HeadSHA   string
@@ -31,6 +32,11 @@ type PR struct {
 
 type TimelineActivity struct {
 	UpdatedAt time.Time
+}
+
+type LastHumanActivity struct {
+	Actor    string
+	Complete bool
 }
 
 type PRList struct {

@@ -118,6 +118,179 @@ const lastTouchedQuery = `query($owner: String!, $name: String!, $number: Int!) 
   }
 }`
 
+const lastHumanTouchQuery = `query($owner: String!, $name: String!, $number: Int!, $before: String) {
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $number) {
+      timelineItems(last: 100, before: $before) {
+        nodes {
+          __typename
+          ... on Comment {
+            author { login __typename }
+            editor { login __typename }
+            createdAt
+            updatedAt
+          }
+          ... on AddedToMergeQueueEvent { actor { login __typename } createdAt }
+          ... on AddedToProjectEvent { actor { login __typename } createdAt }
+          ... on AddedToProjectV2Event { actor { login __typename } createdAt }
+          ... on AddedToStackEvent { actor { login __typename } createdAt }
+          ... on AssignedEvent { actor { login __typename } createdAt }
+          ... on AutoMergeDisabledEvent { actor { login __typename } createdAt }
+          ... on AutoMergeEnabledEvent { actor { login __typename } createdAt }
+          ... on AutoRebaseEnabledEvent { actor { login __typename } createdAt }
+          ... on AutoSquashEnabledEvent { actor { login __typename } createdAt }
+          ... on AutomaticBaseChangeFailedEvent { actor { login __typename } createdAt }
+          ... on AutomaticBaseChangeSucceededEvent { actor { login __typename } createdAt }
+          ... on BaseRefChangedEvent { actor { login __typename } createdAt }
+          ... on BaseRefDeletedEvent { actor { login __typename } createdAt }
+          ... on BaseRefForcePushedEvent { actor { login __typename } createdAt }
+          ... on BlockedByAddedEvent { actor { login __typename } createdAt }
+          ... on BlockedByRemovedEvent { actor { login __typename } createdAt }
+          ... on BlockingAddedEvent { actor { login __typename } createdAt }
+          ... on BlockingRemovedEvent { actor { login __typename } createdAt }
+          ... on ClosedEvent { actor { login __typename } createdAt }
+          ... on CommentDeletedEvent { actor { login __typename } createdAt }
+          ... on ConnectedEvent { actor { login __typename } createdAt }
+          ... on ConvertToDraftEvent { actor { login __typename } createdAt }
+          ... on ConvertedFromDraftEvent { actor { login __typename } createdAt }
+          ... on ConvertedNoteToIssueEvent { actor { login __typename } createdAt }
+          ... on ConvertedToDiscussionEvent { actor { login __typename } createdAt }
+          ... on CrossReferencedEvent { actor { login __typename } createdAt }
+          ... on DemilestonedEvent { actor { login __typename } createdAt }
+          ... on DeployedEvent { actor { login __typename } createdAt }
+          ... on DeploymentEnvironmentChangedEvent { actor { login __typename } createdAt }
+          ... on DisconnectedEvent { actor { login __typename } createdAt }
+          ... on HeadRefDeletedEvent { actor { login __typename } createdAt }
+          ... on HeadRefForcePushedEvent { actor { login __typename } createdAt }
+          ... on HeadRefRestoredEvent { actor { login __typename } createdAt }
+          ... on IssueCommentPinnedEvent { actor { login __typename } createdAt }
+          ... on IssueCommentUnpinnedEvent { actor { login __typename } createdAt }
+          ... on IssueFieldAddedEvent { actor { login __typename } createdAt }
+          ... on IssueFieldChangedEvent { actor { login __typename } createdAt }
+          ... on IssueFieldRemovedEvent { actor { login __typename } createdAt }
+          ... on IssueTypeAddedEvent { actor { login __typename } createdAt }
+          ... on IssueTypeChangedEvent { actor { login __typename } createdAt }
+          ... on IssueTypeRemovedEvent { actor { login __typename } createdAt }
+          ... on LabeledEvent { actor { login __typename } createdAt }
+          ... on LockedEvent { actor { login __typename } createdAt }
+          ... on MarkedAsDuplicateEvent { actor { login __typename } createdAt }
+          ... on MentionedEvent { actor { login __typename } createdAt }
+          ... on MergedEvent { actor { login __typename } createdAt }
+          ... on MilestonedEvent { actor { login __typename } createdAt }
+          ... on MovedColumnsInProjectEvent { actor { login __typename } createdAt }
+          ... on ParentIssueAddedEvent { actor { login __typename } createdAt }
+          ... on ParentIssueRemovedEvent { actor { login __typename } createdAt }
+          ... on PinnedEvent { actor { login __typename } createdAt }
+          ... on ProjectV2ItemStatusChangedEvent { actor { login __typename } createdAt }
+          ... on ReadyForReviewEvent { actor { login __typename } createdAt }
+          ... on ReferencedEvent { actor { login __typename } createdAt }
+          ... on RemovedFromMergeQueueEvent { actor { login __typename } createdAt }
+          ... on RemovedFromProjectEvent { actor { login __typename } createdAt }
+          ... on RemovedFromProjectV2Event { actor { login __typename } createdAt }
+          ... on RenamedTitleEvent { actor { login __typename } createdAt }
+          ... on ReopenedEvent { actor { login __typename } createdAt }
+          ... on ReviewDismissedEvent { actor { login __typename } createdAt }
+          ... on ReviewRequestRemovedEvent { actor { login __typename } createdAt }
+          ... on ReviewRequestedEvent { actor { login __typename } createdAt }
+          ... on SubIssueAddedEvent { actor { login __typename } createdAt }
+          ... on SubIssueRemovedEvent { actor { login __typename } createdAt }
+          ... on TransferredEvent { actor { login __typename } createdAt }
+          ... on UnassignedEvent { actor { login __typename } createdAt }
+          ... on UnlabeledEvent { actor { login __typename } createdAt }
+          ... on UnlockedEvent { actor { login __typename } createdAt }
+          ... on UnmarkedAsDuplicateEvent { actor { login __typename } createdAt }
+          ... on UnpinnedEvent { actor { login __typename } createdAt }
+          ... on UnsubscribedEvent { actor { login __typename } createdAt }
+          ... on UserBlockedEvent { actor { login __typename } createdAt }
+          ... on PullRequestCommit {
+            commit {
+              committedDate
+              author { user { login __typename } }
+              committer { user { login __typename } }
+            }
+          }
+          ... on PullRequestCommitCommentThread {
+            comments(last: 100) {
+              nodes { author { login __typename } editor { login __typename } createdAt updatedAt }
+              pageInfo { hasPreviousPage }
+            }
+          }
+          ... on PullRequestReviewThread {
+            comments(last: 100) {
+              nodes { author { login __typename } editor { login __typename } createdAt updatedAt }
+              pageInfo { hasPreviousPage }
+            }
+          }
+        }
+        pageInfo { hasPreviousPage startCursor }
+      }
+    }
+  }
+}`
+
+const maxLastHumanTouchPages = 5
+
+type timelineActor struct {
+	Login    string `json:"login"`
+	Typename string `json:"__typename"`
+}
+
+type timelineComment struct {
+	Author    *timelineActor `json:"author"`
+	Editor    *timelineActor `json:"editor"`
+	CreatedAt time.Time      `json:"createdAt"`
+	UpdatedAt time.Time      `json:"updatedAt"`
+}
+
+type timelineActorNode struct {
+	Typename  string         `json:"__typename"`
+	CreatedAt time.Time      `json:"createdAt"`
+	UpdatedAt time.Time      `json:"updatedAt"`
+	Author    *timelineActor `json:"author"`
+	Editor    *timelineActor `json:"editor"`
+	Actor     *timelineActor `json:"actor"`
+	Commit    *struct {
+		CommittedDate time.Time `json:"committedDate"`
+		Author        struct {
+			User *timelineActor `json:"user"`
+		} `json:"author"`
+		Committer struct {
+			User *timelineActor `json:"user"`
+		} `json:"committer"`
+	} `json:"commit"`
+	Comments *struct {
+		Nodes    []timelineComment `json:"nodes"`
+		PageInfo struct {
+			HasPreviousPage bool `json:"hasPreviousPage"`
+		} `json:"pageInfo"`
+	} `json:"comments"`
+}
+
+type timelineTouch struct {
+	actor   *timelineActor
+	at      time.Time
+	unknown bool
+}
+
+type timelineActorPage struct {
+	Data struct {
+		Repository *struct {
+			PullRequest *struct {
+				TimelineItems struct {
+					Nodes    []timelineActorNode `json:"nodes"`
+					PageInfo struct {
+						HasPreviousPage bool   `json:"hasPreviousPage"`
+						StartCursor     string `json:"startCursor"`
+					} `json:"pageInfo"`
+				} `json:"timelineItems"`
+			} `json:"pullRequest"`
+		} `json:"repository"`
+	} `json:"data"`
+	Errors []struct {
+		Message string `json:"message"`
+	} `json:"errors"`
+}
+
 type Enricher struct {
 	CLI  string
 	Now  func() time.Time
@@ -241,6 +414,9 @@ func (e Enricher) FetchField(ctx context.Context, key domain.FieldKey) (any, dom
 	if err != nil {
 		return nil, domain.Provenance{}, err
 	}
+	if key.Name == "last_human_touch" {
+		return e.fetchLastHumanTouch(ctx, key, owner, name)
+	}
 	query, ok := fieldQueries[key.Name]
 	if !ok {
 		return nil, domain.Provenance{}, &domain.FetchError{Kind: domain.ErrorPermanent, Message: "unsupported GitHub field: " + key.Name}
@@ -305,6 +481,180 @@ func (e Enricher) FetchField(ctx context.Context, key domain.FieldKey) (any, dom
 	provenance.Version = now.Format(time.RFC3339Nano)
 	provenance.FreshUntil = now.Add(fieldFreshFor)
 	return value, provenance, nil
+}
+
+func (e Enricher) fetchLastHumanTouch(ctx context.Context, key domain.FieldKey, owner, name string) (any, domain.Provenance, error) {
+	cli := e.CLI
+	if cli == "" {
+		cli = "gh"
+	}
+	before := ""
+	seenCursors := map[string]bool{}
+	var quota *domain.QuotaObservation
+	var observedAt time.Time
+	for pageNumber := 0; pageNumber < maxLastHumanTouchPages; pageNumber++ {
+		if e.Gate != nil {
+			if err := e.Gate.Wait(ctx); err != nil {
+				return nil, domain.Provenance{Quota: quota}, fetch.Classify(err)
+			}
+		}
+		args := []string{"api", "graphql", "--include", "-f", "query=" + lastHumanTouchQuery,
+			"-F", "owner=" + owner, "-F", "name=" + name, "-F", fmt.Sprintf("number=%d", key.Item.Number)}
+		if before != "" {
+			args = append(args, "-F", "before="+before)
+		}
+		output, commandErr := exec.CommandContext(ctx, cli, args...).CombinedOutput()
+		observedAt = time.Now()
+		if e.Now != nil {
+			observedAt = e.Now()
+		}
+		headers, body, responseErr := parseIncludedResponse(output)
+		pageQuota := parseQuotaObservation(headers, observedAt)
+		quota = conservativeQuota(quota, pageQuota)
+		provenance := domain.Provenance{Source: "github", Quota: quota}
+		if commandErr != nil {
+			issue := classifyCLIError(commandErr, string(output))
+			applyRateLimitMetadata(e.Gate, issue, headers, pageQuota, observedAt)
+			return nil, provenance, issue
+		}
+		if responseErr != nil {
+			applyRateLimitMetadata(e.Gate, nil, headers, pageQuota, observedAt)
+			return nil, provenance, &domain.FetchError{Kind: domain.ErrorTransient, Message: "GitHub returned unreadable timeline actor metadata"}
+		}
+		var page timelineActorPage
+		if err := json.NewDecoder(bytes.NewReader(body)).Decode(&page); err != nil {
+			applyRateLimitMetadata(e.Gate, nil, headers, pageQuota, observedAt)
+			return nil, provenance, &domain.FetchError{Kind: domain.ErrorTransient, Message: "GitHub returned unreadable timeline actor data"}
+		}
+		if len(page.Errors) > 0 {
+			issue := classifyCLIError(fmt.Errorf("GraphQL error"), page.Errors[0].Message)
+			applyRateLimitMetadata(e.Gate, issue, headers, pageQuota, observedAt)
+			return nil, provenance, issue
+		}
+		applyRateLimitMetadata(e.Gate, nil, headers, pageQuota, observedAt)
+		if page.Data.Repository == nil || page.Data.Repository.PullRequest == nil {
+			return nil, provenance, &domain.FetchError{Kind: domain.ErrorPermission, Message: "GitHub pull request unavailable or access denied"}
+		}
+
+		pullRequest := page.Data.Repository.PullRequest
+		touches := timelineTouches(pullRequest.TimelineItems.Nodes)
+		for _, touch := range touches {
+			if touch.unknown && touch.at.IsZero() {
+				provenance.FetchedAt = observedAt
+				provenance.Version = observedAt.Format(time.RFC3339Nano)
+				provenance.FreshUntil = observedAt.Add(fieldFreshFor)
+				return domain.LastHumanActivity{Complete: false}, provenance, nil
+			}
+		}
+		sort.SliceStable(touches, func(i, j int) bool { return touches[i].at.After(touches[j].at) })
+		for _, touch := range touches {
+			if touch.unknown || touch.actor == nil || strings.TrimSpace(touch.actor.Login) == "" {
+				provenance.FetchedAt = observedAt
+				provenance.Version = observedAt.Format(time.RFC3339Nano)
+				provenance.FreshUntil = observedAt.Add(fieldFreshFor)
+				return domain.LastHumanActivity{Complete: false}, provenance, nil
+			}
+			if isBotActor(touch.actor) {
+				continue
+			}
+			provenance.FetchedAt = observedAt
+			provenance.Version = observedAt.Format(time.RFC3339Nano)
+			provenance.FreshUntil = observedAt.Add(fieldFreshFor)
+			return domain.LastHumanActivity{Actor: touch.actor.Login, Complete: true}, provenance, nil
+		}
+		pageInfo := pullRequest.TimelineItems.PageInfo
+		if !pageInfo.HasPreviousPage {
+			provenance.FetchedAt = observedAt
+			provenance.Version = observedAt.Format(time.RFC3339Nano)
+			provenance.FreshUntil = observedAt.Add(fieldFreshFor)
+			return domain.LastHumanActivity{Complete: true}, provenance, nil
+		}
+		if pageInfo.StartCursor == "" {
+			provenance.FetchedAt = observedAt
+			provenance.Version = observedAt.Format(time.RFC3339Nano)
+			provenance.FreshUntil = observedAt.Add(fieldFreshFor)
+			return domain.LastHumanActivity{Complete: false}, provenance, nil
+		}
+		if seenCursors[pageInfo.StartCursor] {
+			provenance.FetchedAt = observedAt
+			provenance.Version = observedAt.Format(time.RFC3339Nano)
+			provenance.FreshUntil = observedAt.Add(fieldFreshFor)
+			return domain.LastHumanActivity{Complete: false}, provenance, nil
+		}
+		seenCursors[pageInfo.StartCursor] = true
+		before = pageInfo.StartCursor
+	}
+	provenance := domain.Provenance{Source: "github", Quota: quota, FetchedAt: observedAt, Version: observedAt.Format(time.RFC3339Nano), FreshUntil: observedAt.Add(fieldFreshFor)}
+	return domain.LastHumanActivity{Complete: false}, provenance, nil
+}
+
+func timelineTouches(nodes []timelineActorNode) []timelineTouch {
+	var touches []timelineTouch
+	for _, node := range nodes {
+		switch node.Typename {
+		case "PullRequestCommit":
+			if node.Commit == nil || node.Commit.CommittedDate.IsZero() {
+				continue
+			}
+			actor := node.Commit.Committer.User
+			if actor == nil {
+				actor = node.Commit.Author.User
+			}
+			touches = append(touches, timelineTouch{actor: actor, at: node.Commit.CommittedDate, unknown: actor == nil})
+		case "IssueComment", "PullRequestReview", "PullRequestReviewComment":
+			touches = append(touches, commentTouches(timelineComment{Author: node.Author, Editor: node.Editor, CreatedAt: node.CreatedAt, UpdatedAt: node.UpdatedAt})...)
+		case "PullRequestCommitCommentThread", "PullRequestReviewThread":
+			if node.Comments == nil {
+				touches = append(touches, timelineTouch{unknown: true})
+				continue
+			}
+			threadTouches := make([]timelineTouch, 0, len(node.Comments.Nodes)+1)
+			for _, comment := range node.Comments.Nodes {
+				threadTouches = append(threadTouches, commentTouches(comment)...)
+			}
+			if node.Comments.PageInfo.HasPreviousPage {
+				earliest := time.Time{}
+				for _, touch := range threadTouches {
+					if !touch.at.IsZero() && (earliest.IsZero() || touch.at.Before(earliest)) {
+						earliest = touch.at
+					}
+				}
+				threadTouches = append(threadTouches, timelineTouch{at: earliest, unknown: true})
+			}
+			touches = append(touches, threadTouches...)
+		case "SubscribedEvent":
+			// GitHub emits subscription markers without an actor or timestamp.
+			// They do not identify a person touching the pull request.
+			continue
+		default:
+			if node.Actor != nil && !node.CreatedAt.IsZero() {
+				touches = append(touches, timelineTouch{actor: node.Actor, at: node.CreatedAt})
+			} else if node.Typename != "PullRequestRevisionMarker" && node.Typename != "" {
+				touches = append(touches, timelineTouch{at: node.CreatedAt, unknown: true})
+			}
+		}
+	}
+	return touches
+}
+
+func commentTouches(comment timelineComment) []timelineTouch {
+	var touches []timelineTouch
+	if comment.Author == nil && !comment.CreatedAt.IsZero() {
+		touches = append(touches, timelineTouch{at: comment.CreatedAt, unknown: true})
+	} else if comment.Author != nil && !comment.CreatedAt.IsZero() {
+		touches = append(touches, timelineTouch{actor: comment.Author, at: comment.CreatedAt})
+	}
+	if comment.Editor != nil && comment.UpdatedAt.After(comment.CreatedAt) {
+		touches = append(touches, timelineTouch{actor: comment.Editor, at: comment.UpdatedAt})
+	}
+	return touches
+}
+
+func isBotActor(actor *timelineActor) bool {
+	if actor == nil {
+		return false
+	}
+	return strings.EqualFold(actor.Typename, "Bot") || strings.HasSuffix(strings.ToLower(actor.Login), "[bot]")
 }
 
 func (e Enricher) FetchFields(ctx context.Context, keys []domain.FieldKey) map[domain.FieldKey]ports.FieldResult {

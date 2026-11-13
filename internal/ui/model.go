@@ -333,6 +333,8 @@ func decodeCachedValue(name string, encoded []byte) (any, bool) {
 		value = &domain.ActivityEvidence{}
 	case "last_touched":
 		value = &domain.TimelineActivity{}
+	case "last_human_touch":
+		value = &domain.LastHumanActivity{}
 	default:
 		return nil, false
 	}
@@ -355,6 +357,8 @@ func dereferenceCachedValue(value any) any {
 	case *domain.ActivityEvidence:
 		return *typed
 	case *domain.TimelineActivity:
+		return *typed
+	case *domain.LastHumanActivity:
 		return *typed
 	default:
 		return value
@@ -561,7 +565,7 @@ func (m Model) active() bool {
 	}
 	for _, section := range m.sections {
 		for _, pr := range section.field.Value {
-			for _, name := range []string{"checks", "reviews", "review_requests", "assignees", "review_threads"} {
+			for _, name := range []string{"checks", "reviews", "review_requests", "assignees", "review_threads", "last_human_touch"} {
 				if f := m.fieldFor(pr, name); f != nil && f.Phase.Active() {
 					return true
 				}
@@ -1033,7 +1037,7 @@ func (m Model) sectionStatus(s section, projected triage.Sections) (string, visu
 
 func (m Model) filterCountSummary(s section, projected triage.Sections) string {
 	filtered, pending := 0, 0
-	for _, rows := range [][]triage.Row{projected.Review, projected.Active} {
+	for _, rows := range [][]triage.Row{projected.Default, projected.LastTouchedByMe, projected.Active, projected.Drafts} {
 		for _, row := range rows {
 			if row.PR.ID.Repo != s.repo {
 				continue

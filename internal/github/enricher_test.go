@@ -58,6 +58,70 @@ func TestCombinedSummaryQueryDecodesEachFieldIndependently(t *testing.T) {
 	}
 }
 
+func TestFetchLastHumanTouchSkipsBotsAndPaginates(t *testing.T) {
+	now := time.Date(2026, 11, 6, 17, 0, 0, 0, time.UTC)
+	reset := now.Add(time.Hour)
+	first := responseWithQuota("200 OK", 5000, 20, 4980, reset,
+		`{"data":{"repository":{"pullRequest":{"timelineItems":{"nodes":[{"__typename":"IssueComment","author":{"login":"automation[bot]","__typename":"Bot"},"editor":null,"createdAt":"2026-11-06T16:59:00Z","updatedAt":"2026-11-06T16:59:00Z"}],"pageInfo":{"hasPreviousPage":true,"startCursor":"cursor-1"}}}}}}`)
+	second := responseWithQuota("200 OK", 5000, 21, 4979, reset,
+		`{"data":{"repository":{"pullRequest":{"timelineItems":{"nodes":[{"__typename":"PullRequestReview","author":{"login":"me","__typename":"User"},"editor":null,"createdAt":"2026-11-06T16:00:00Z","updatedAt":"2026-11-06T16:00:00Z"}],"pageInfo":{"hasPreviousPage":false,"startCursor":"cursor-0"}}}}}}`)
+	callFile := filepath.Join(t.TempDir(), "calls")
+	cli := filepath.Join(t.TempDir(), "gh")
+	script := fmt.Sprintf("#!/bin/sh\nprintf 'call\\n' >> %q\ncase \"$*\" in\n*'before=cursor-1'*) cat <<'FS_DASH_BODY'\n%sFS_DASH_BODY\n;;\n*) cat <<'FS_DASH_BODY'\n%sFS_DASH_BODY\n;;\nesac\n", callFile, second, first)
+	if err := os.WriteFile(cli, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	key := domain.FieldKey{Item: domain.ItemID{Source: "github", Host: "github.com", Repo: "owner/repo", Number: 9}, Name: "last_human_touch", Revision: "head"}
+	value, provenance, err := (Enricher{CLI: cli, Now: func() time.Time { return now }}).FetchField(context.Background(), key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	activity := value.(domain.LastHumanActivity)
+	if !activity.Complete || activity.Actor != "me" {
+		t.Fatalf("last human activity = %+v", activity)
+	}
+	if calls, err := os.ReadFile(callFile); err != nil || strings.Count(string(calls), "call") != 2 {
+		t.Fatalf("timeline actor page count = %q, err=%v", calls, err)
+	}
+	if provenance.Quota == nil || provenance.Quota.Remaining != 4979 {
+		t.Fatalf("quota did not retain the most conservative page observation: %+v", provenance.Quota)
+	}
+}
+
+func TestFetchLastHumanTouchDoesNotGuessFromUnknownActorOrRepeatedCursor(t *testing.T) {
+	now := time.Date(2026, 11, 6, 17, 0, 0, 0, time.UTC)
+	reset := now.Add(time.Hour)
+	unknown := responseWithQuota("200 OK", 5000, 20, 4980, reset,
+		`{"data":{"repository":{"pullRequest":{"timelineItems":{"nodes":[{"__typename":"IssueComment","author":null,"editor":null,"createdAt":"2026-11-06T16:59:00Z","updatedAt":"2026-11-06T16:59:00Z"}],"pageInfo":{"hasPreviousPage":false,"startCursor":"cursor-0"}}}}}}`)
+	key := domain.FieldKey{Item: domain.ItemID{Source: "github", Host: "github.com", Repo: "owner/repo", Number: 10}, Name: "last_human_touch", Revision: "head"}
+	value, _, err := (Enricher{CLI: fakeGH(t, unknown, "", 0), Now: func() time.Time { return now }}).FetchField(context.Background(), key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if activity := value.(domain.LastHumanActivity); activity.Complete || activity.Actor != "" {
+		t.Fatalf("unknown actor was treated as complete: %+v", activity)
+	}
+
+	botPage := responseWithQuota("200 OK", 5000, 20, 4980, reset,
+		`{"data":{"repository":{"pullRequest":{"timelineItems":{"nodes":[{"__typename":"IssueComment","author":{"login":"automation[bot]","__typename":"User"},"editor":null,"createdAt":"2026-11-06T16:59:00Z","updatedAt":"2026-11-06T16:59:00Z"}],"pageInfo":{"hasPreviousPage":true,"startCursor":"cursor-1"}}}}}}`)
+	callFile := filepath.Join(t.TempDir(), "calls")
+	cli := filepath.Join(t.TempDir(), "gh")
+	script := fmt.Sprintf("#!/bin/sh\nprintf 'call\\n' >> %q\ncat <<'FS_DASH_BODY'\n%sFS_DASH_BODY\n", callFile, botPage)
+	if err := os.WriteFile(cli, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	value, _, err = (Enricher{CLI: cli, Now: func() time.Time { return now }}).FetchField(context.Background(), key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if activity := value.(domain.LastHumanActivity); activity.Complete || activity.Actor != "" {
+		t.Fatalf("repeated cursor was treated as complete: %+v", activity)
+	}
+	if calls, err := os.ReadFile(callFile); err != nil || strings.Count(string(calls), "call") != 2 {
+		t.Fatalf("repeated cursor query count = %q, err=%v", calls, err)
+	}
+}
+
 func TestClassifyActivityRequiresTrustedCurrentStatus(t *testing.T) {
 	now := time.Date(2026, 11, 3, 15, 0, 0, 0, time.UTC)
 	start := now.Add(-20 * time.Minute)

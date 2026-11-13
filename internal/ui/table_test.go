@@ -57,7 +57,7 @@ func TestTableRendersLinkedSummariesAndSelectedRow(t *testing.T) {
 	putField(&m, pr, "reviews", domain.ReviewSet{Reviews: []domain.Review{{Author: "reviewer", State: "APPROVED"}}, Complete: true}, now)
 	putField(&m, pr, "review_threads", domain.ThreadSummary{Unresolved: 2, Complete: true}, now)
 	putField(&m, pr, "last_touched", domain.TimelineActivity{UpdatedAt: now.Add(-48 * time.Hour)}, now)
-	row := m.projection().Review[0]
+	row := m.projection().Default[0]
 	specs, widths := m.tableColumns([]triage.Row{row}, false)
 	line := m.renderTableRow(row, specs, widths, true)
 	plain := ansi.Strip(line)
@@ -96,7 +96,7 @@ func TestCompactColumnPresentationAndWidths(t *testing.T) {
 		{Author: "renovate[bot]", IsBot: true, State: "CHANGES_REQUESTED"},
 	}, Complete: true}, now)
 	putField(&m, pr, "review_threads", domain.ThreadSummary{Unresolved: 123, Complete: false}, now)
-	row := m.projection().Review[0]
+	row := m.projection().Default[0]
 
 	emojiSpecs, emojiWidths := m.tableColumns([]triage.Row{row}, false)
 	emojiHeader := ansi.Strip(m.renderTableHeader(emojiSpecs, emojiWidths))
@@ -192,7 +192,7 @@ func TestNarrowTableKeepsPRAndTitle(t *testing.T) {
 	pr.Title = "A narrow terminal title"
 	m := loadedModel(t, []domain.PR{pr})
 	m.width, m.height, m.visual.compact = 40, 12, true
-	rows := m.projection().Review
+	rows := m.projection().Default
 	for _, emojiMode := range []bool{true, false} {
 		m.emojiMode = emojiMode
 		specs, widths := m.tableColumns(rows, false)
@@ -232,7 +232,7 @@ func TestSnoozedTableAddsWakeColumn(t *testing.T) {
 	}
 }
 
-func TestDisplayModeAppliesToReviewAndActiveSections(t *testing.T) {
+func TestDisplayModeAppliesToAllPRSections(t *testing.T) {
 	now := time.Date(2026, 11, 6, 12, 0, 0, 0, time.UTC)
 	reviewPR := testUIPr(71, now)
 	activePR := testUIPr(72, now.Add(-time.Minute))
@@ -246,13 +246,13 @@ func TestDisplayModeAppliesToReviewAndActiveSections(t *testing.T) {
 	m.ensureSelection()
 
 	emojiView := ansi.Strip(m.View())
-	if strings.Count(emojiView, "🧪") != 2 || !strings.Contains(emojiView, "ACTIVE FULLSEND AGENTS") {
-		t.Fatalf("emoji mode was not used in both Review and Active sections: %s", emojiView)
+	if strings.Count(emojiView, "🧪") != 2 || !strings.Contains(emojiView, "ACTIVE FULLSEND AGENTS") || strings.Contains(emojiView, "LAST TOUCHED BY ME") || strings.Contains(emojiView, "DRAFTS") {
+		t.Fatalf("emoji mode was not used in the nonempty PR sections: %s", emojiView)
 	}
 	next, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'e'}})
 	m = next.(Model)
 	textView := ansi.Strip(m.View())
 	if strings.Count(textView, "Checks") != 2 || strings.Contains(textView, "🧪") {
-		t.Fatalf("text mode was not used in both Review and Active sections: %s", textView)
+		t.Fatalf("text mode was not used in the nonempty PR sections: %s", textView)
 	}
 }

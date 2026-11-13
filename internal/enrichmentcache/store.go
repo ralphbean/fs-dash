@@ -171,7 +171,7 @@ func validEntry(entry Entry) bool {
 
 func cacheableField(name string) bool {
 	switch name {
-	case "checks", "reviews", "review_requests", "assignees", "review_threads", "activity", "last_touched":
+	case "checks", "reviews", "review_requests", "assignees", "review_threads", "activity", "last_touched", "last_human_touch":
 		return true
 	default:
 		return false
