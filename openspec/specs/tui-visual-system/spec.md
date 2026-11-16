@@ -69,7 +69,7 @@ The log console SHALL give debug, info, warning, and error levels distinct seman
 - **THEN** the two events are visually distinct and their level labels remain visible
 
 ### Requirement: PR list uses a justified table across repositories
-The list SHALL show rows from all configured repositories in one priority-sorted table, while retaining separate Review and Active sections and the existing repository summaries. The columns SHALL appear in this order: Star, PR link, Title, Author, Assignees, Updated, Checks, Human review, Bot review, and Threads. The Star column header SHALL be empty. The Snoozed view SHALL add Wake as the final column. Updated SHALL show the relative time of the newest visible item in the PR's GitHub timeline, including commits, comments, reviews, and timeline events. Changes to GitHub's PR `updatedAt` that do not create a visible timeline item SHALL NOT change the Updated value. The table SHALL restore the user's saved emoji or text mode; when no mode has been saved, it SHALL start in emoji mode. In emoji mode, Checks, Human review, Bot review, and Threads SHALL use compact emoji headers and state representations; text mode SHALL retain their descriptive headers and values. The two modes SHALL represent the same underlying values, and useful check and thread counts SHALL remain visible in both modes. Column widths SHALL be calculated from the active mode and SHALL NOT reserve space for text labels while emoji mode is active.
+The list SHALL show rows from all configured repositories in one priority-sorted table, while retaining separate Review and Active sections and the existing repository summaries. The columns SHALL appear in this order: Star, PR link, Title, Author, Assignees, Updated, By, Checks, Human review, Bot review, and Threads. The Star column header SHALL be empty. The Snoozed view SHALL add Wake as the final column. Updated SHALL show the relative time of the newest visible item in the PR's GitHub timeline, including commits, comments, reviews, and timeline events. Changes to GitHub's PR `updatedAt` that do not create a visible timeline item SHALL NOT change the Updated value. By SHALL show the latest human actor from the timeline activity used to classify the Last touched by me section, and SHALL ignore bot activity. The table SHALL restore the user's saved emoji or text mode; when no mode has been saved, it SHALL start in emoji mode. In emoji mode, Checks, Human review, Bot review, and Threads SHALL use compact emoji headers and state representations; text mode SHALL retain their descriptive headers and values. The By column SHALL retain its text label and value in both modes. The two modes SHALL represent the same underlying values, and useful check and thread counts SHALL remain visible in both modes. Column widths SHALL be calculated from the active mode and SHALL NOT reserve space for text labels while emoji mode is active.
 
 #### Scenario: PR identity is a clickable repository link
 - **WHEN** a PR row is rendered
@@ -77,7 +77,7 @@ The list SHALL show rows from all configured repositories in one priority-sorted
 
 #### Scenario: Table aligns row data
 - **WHEN** a table row is rendered
-- **THEN** text columns are left-aligned, counts and relative times are right-aligned, and Star and compact status columns are centered
+- **THEN** text columns, including By, are left-aligned, counts and relative times are right-aligned, and Star and compact status columns are centered
 
 #### Scenario: Star column has no header label
 - **WHEN** a table header is rendered
@@ -85,15 +85,31 @@ The list SHALL show rows from all configured repositories in one priority-sorted
 
 #### Scenario: Table shows row summaries
 - **WHEN** a PR row is rendered
-- **THEN** its assignees are listed and truncated to fit, Updated uses the relative time of the newest visible PR timeline item, Checks shows a compact state, Human review and Bot review each show their source-specific current state, and Threads shows the unresolved count
+- **THEN** its assignees are listed and truncated to fit, Updated uses the relative time of the newest visible PR timeline item, By shows the latest human actor or an em dash when none exists, Checks shows a compact state, Human review and Bot review each show their source-specific current state, and Threads shows the unresolved count
+
+#### Scenario: By uses the latest human timeline actor
+- **WHEN** a PR has complete timeline actor data
+- **THEN** By shows the latest human actor used by the Last touched by me classification
+
+#### Scenario: Bot activity does not appear in By
+- **WHEN** the latest PR timeline activity is by a bot and an earlier human activity exists
+- **THEN** By shows the earlier human actor
+
+#### Scenario: No human timeline activity exists
+- **WHEN** timeline actor data is complete but contains no human activity
+- **THEN** By shows an em dash
+
+#### Scenario: By activity is incomplete or unavailable
+- **WHEN** actor data is pending, incomplete, failed, or unavailable
+- **THEN** By shows the corresponding pending or unavailable state rather than an inferred actor
 
 #### Scenario: Emoji mode uses compact labels and state marks
 - **WHEN** the table is in emoji mode
-- **THEN** the Checks, Human review, Bot review, and Threads headers use 🧪, 👤, 🤖, and 🧵 respectively; pending, stale, failed, and unknown states use ⏳, 🕰️, ❌, and ❔ respectively, while loading uses the current frame of the animated spinner; check outcomes use ✅ for pass, ❌ plus the failure count for failures, 🔄 plus the count for running checks, ⚠️ for partial results, and ➖ for no checks; both review outcomes use ✅ for approved, 🛑 for changes requested, 💬 for commented, and 💤 for awaiting review; and thread results show the unresolved count, retaining `+` for incomplete counts
+- **THEN** the Checks, Human review, Bot review, and Threads headers use 🧪, 👤, 🤖, and 🧵 respectively; By retains its text label; pending, stale, failed, and unknown states use ⏳, 🕰️, ❌, and ❔ respectively, while loading uses the current frame of the animated spinner; check outcomes use ✅ for pass, ❌ plus the failure count for failures, 🔄 plus the count for running checks, ⚠️ for partial results, and ➖ for no checks; both review outcomes use ✅ for approved, 🛑 for changes requested, 💬 for commented, and 💤 for awaiting review; and thread results show the unresolved count, retaining `+` for incomplete counts
 
 #### Scenario: Text mode retains descriptive cell values
 - **WHEN** the table is in text mode
-- **THEN** Checks, Human review, Bot review, and Threads show descriptive headers and the existing textual values for pending, loading, stale, failed, unknown, check outcomes, review outcomes, and unresolved thread counts
+- **THEN** Checks, Human review, Bot review, and Threads show descriptive headers and the existing textual values for pending, loading, stale, failed, unknown, check outcomes, review outcomes, and unresolved thread counts, while By shows the same actor value as in emoji mode
 
 #### Scenario: Saved display mode is used by the table
 - **WHEN** a saved emoji or text mode is restored

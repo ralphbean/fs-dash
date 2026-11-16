@@ -16,8 +16,8 @@ import (
 
 func TestListTableColumnOrderAndAlignment(t *testing.T) {
 	specs := listTableSpecs(false)
-	wantColumns := []tableColumn{columnStar, columnPR, columnTitle, columnAuthor, columnAssignees, columnUpdated, columnChecks, columnHumanReview, columnBotReview, columnThreads}
-	wantAlignments := []tableAlignment{alignCenter, alignLeft, alignLeft, alignLeft, alignLeft, alignRight, alignCenter, alignCenter, alignCenter, alignRight}
+	wantColumns := []tableColumn{columnStar, columnPR, columnTitle, columnAuthor, columnAssignees, columnUpdated, columnBy, columnChecks, columnHumanReview, columnBotReview, columnThreads}
+	wantAlignments := []tableAlignment{alignCenter, alignLeft, alignLeft, alignLeft, alignLeft, alignRight, alignLeft, alignCenter, alignCenter, alignCenter, alignRight}
 	if len(specs) != len(wantColumns) {
 		t.Fatalf("normal table has %d columns, want %d", len(specs), len(wantColumns))
 	}

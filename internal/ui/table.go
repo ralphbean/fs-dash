@@ -47,6 +47,7 @@ const (
 	columnAuthor      tableColumn = "author"
 	columnAssignees   tableColumn = "assignees"
 	columnUpdated     tableColumn = "updated"
+	columnBy          tableColumn = "by"
 	columnChecks      tableColumn = "checks"
 	columnHumanReview tableColumn = "human_review"
 	columnBotReview   tableColumn = "bot_review"
@@ -157,6 +158,7 @@ func listTableSpecs(withWake bool) []tableColumnSpec {
 		{column: columnAuthor, label: "Author", min: 8, max: 18, align: alignLeft},
 		{column: columnAssignees, label: "Assignees", min: 10, max: 22, align: alignLeft},
 		{column: columnUpdated, label: "Updated", min: 13, max: 13, align: alignRight},
+		{column: columnBy, label: "By", min: 8, max: 18, align: alignLeft},
 		{column: columnChecks, label: "Checks", emojiLabel: "🧪", min: 9, max: 9, align: alignCenter},
 		{column: columnHumanReview, label: "Human review", emojiLabel: "👤", min: 12, max: 12, align: alignCenter},
 		{column: columnBotReview, label: "Bot review", emojiLabel: "🤖", min: 10, max: 10, align: alignCenter},
@@ -213,6 +215,8 @@ func (m Model) tableCellFor(row triage.Row, column tableColumn) tableCell {
 		return m.assigneeCell(row.PR)
 	case columnUpdated:
 		return m.updatedCell(row.PR)
+	case columnBy:
+		return m.lastHumanTouchCell(row.PR)
 	case columnChecks:
 		return m.checksCell(row.PR)
 	case columnHumanReview:
@@ -254,6 +258,40 @@ func (m Model) updatedCell(pr domain.PR) tableCell {
 		role = roleStale
 	}
 	return tableCell{text: relativeTime(m.opts.Clock.Now(), activity.UpdatedAt), role: role}
+}
+
+func (m Model) lastHumanTouchCell(pr domain.PR) tableCell {
+	field := m.fieldFor(pr, "last_human_touch")
+	if field == nil {
+		return tableCell{text: "pending", role: roleUnrequested}
+	}
+	if field.Phase == domain.Failed || field.Phase == domain.Cooldown {
+		return tableCell{text: "unavailable", role: roleFailure}
+	}
+	if field.Phase == domain.Canceled {
+		return tableCell{text: "unavailable", role: roleMuted}
+	}
+	if !field.HasValue {
+		return tableCell{text: "pending", role: roleUnrequested}
+	}
+	activity, ok := field.Value.(domain.LastHumanActivity)
+	if !ok {
+		return tableCell{text: "unavailable", role: roleMuted}
+	}
+	if !activity.Complete {
+		return tableCell{text: "pending", role: rolePending}
+	}
+	role := roleMuted
+	if field.Stale(m.opts.Clock.Now()) {
+		role = roleStale
+	} else if field.Phase.Active() {
+		role = rolePending
+	}
+	actor := strings.TrimSpace(activity.Actor)
+	if actor == "" {
+		return tableCell{text: "—", role: role}
+	}
+	return tableCell{text: actor, role: role}
 }
 
 func (m Model) assigneeCell(pr domain.PR) tableCell {
@@ -497,7 +535,7 @@ func (m Model) tableColumns(rows []triage.Row, withWake bool) ([]tableColumnSpec
 				cell := m.tableCellFor(row, spec.column)
 				width = max(width, lipgloss.Width(cell.render(tableDisplayEmoji)))
 			}
-		} else if spec.column == columnPR || spec.column == columnAuthor || spec.column == columnAssignees {
+		} else if spec.column == columnPR || spec.column == columnAuthor || spec.column == columnAssignees || spec.column == columnBy {
 			for _, row := range rows {
 				cell := m.tableCellFor(row, spec.column)
 				width = max(width, lipgloss.Width(cell.render(tableDisplayText)))
