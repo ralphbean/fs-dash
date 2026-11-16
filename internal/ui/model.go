@@ -117,6 +117,7 @@ type Model struct {
 	detailsScroll                   int
 	threadIndex                     int
 	threadScroll                    int
+	pendingThreadResolutions        map[threadResolutionKey]uint64
 	editorReturnMode                string
 	editorThreadID                  string
 	editorBuffer                    []rune
@@ -209,7 +210,7 @@ func New(opts Options) Model {
 	if opts.Reminders == nil {
 		opts.Reminders = reminder.NewMemoryStore()
 	}
-	m := Model{opts: opts, mode: "list", logLevel: "all", width: 100, height: 30, fields: map[domain.FieldKey]*domain.Field[any]{}, detailFields: map[domain.DetailKey]*domain.Field[any]{}, detailAttempts: map[domain.DetailKey]int{}, replyDrafts: map[string]string{}, cacheEntries: map[domain.FieldKey]enrichmentcache.Entry{}, fieldAttempts: map[domain.FieldKey]int{}, fieldQueued: map[domain.FieldKey]bool{}, fieldQueueGeneration: map[domain.FieldKey]uint64{}, fieldPriorityGeneration: map[domain.FieldKey]uint64{}, fieldInFlight: map[domain.FieldKey]uint64{}, fieldRequestForKey: map[domain.FieldKey]string{}, fieldRequestsInFlight: map[string]int{}, activityQueued: map[domain.FieldKey]bool{}, activityQueueGeneration: map[domain.FieldKey]uint64{}, activityPriorityGeneration: map[domain.FieldKey]uint64{}, activityInFlight: map[domain.FieldKey]uint64{}, filter: triage.FilterAuthored, emojiMode: true, visual: newVisualTheme(opts.Config)}
+	m := Model{opts: opts, mode: "list", logLevel: "all", width: 100, height: 30, fields: map[domain.FieldKey]*domain.Field[any]{}, detailFields: map[domain.DetailKey]*domain.Field[any]{}, detailAttempts: map[domain.DetailKey]int{}, replyDrafts: map[string]string{}, pendingThreadResolutions: map[threadResolutionKey]uint64{}, cacheEntries: map[domain.FieldKey]enrichmentcache.Entry{}, fieldAttempts: map[domain.FieldKey]int{}, fieldQueued: map[domain.FieldKey]bool{}, fieldQueueGeneration: map[domain.FieldKey]uint64{}, fieldPriorityGeneration: map[domain.FieldKey]uint64{}, fieldInFlight: map[domain.FieldKey]uint64{}, fieldRequestForKey: map[domain.FieldKey]string{}, fieldRequestsInFlight: map[string]int{}, activityQueued: map[domain.FieldKey]bool{}, activityQueueGeneration: map[domain.FieldKey]uint64{}, activityPriorityGeneration: map[domain.FieldKey]uint64{}, activityInFlight: map[domain.FieldKey]uint64{}, filter: triage.FilterAuthored, emojiMode: true, visual: newVisualTheme(opts.Config)}
 	m.visual.compact = m.width < 64
 	if opts.ReminderLoadError != nil {
 		m.reminderWarning = "Local triage state: " + opts.ReminderLoadError.Error()

@@ -61,6 +61,11 @@ type threadResolveMsg struct {
 	err      error
 }
 
+type threadResolutionKey struct {
+	item     domain.ItemID
+	threadID string
+}
+
 type pendingWrite struct {
 	key       domain.DetailKey
 	threadID  string
@@ -166,22 +171,38 @@ func (m *Model) applyDetailMessage(msg detailFetchMsg) []tea.Cmd {
 		}
 		return nil
 	}
+	selectedThreadID, selectedThreadIndex := m.currentThreadSelection(msg.key.Item)
 	if msg.err != nil {
 		issue := fetch.Classify(msg.err)
 		retryAt := fetch.RetryAt(issue, msg.attempt, msg.at)
 		field.Fail(msg.generation, issue, retryAt)
-		if !retryAt.IsZero() {
-			return []tea.Cmd{tea.Tick(max(time.Until(retryAt), time.Millisecond), func(time.Time) tea.Msg {
-				return detailRetryMsg{key: msg.key, generation: msg.generation}
-			})}
-		}
 		m.status = fmt.Sprintf("%s detail failed: %s", msg.key.Group, issue.Message)
 		m.log("error", "fetch-pr-detail", msg.key.String(), msg.attempt, 0, issue.Message)
 		if m.writePending != nil && m.writePending.key == msg.key {
 			m.status = "Could not verify the posted text; draft retained. Refresh before retrying."
 			m.writePending = nil
 		}
+		if msg.key.Group == "threads" {
+			m.failPendingThreadResolutions(msg.key.Item, msg.generation)
+			m.restoreThreadSelection(msg.key.Item, selectedThreadID, selectedThreadIndex)
+		}
+		if !retryAt.IsZero() {
+			return []tea.Cmd{tea.Tick(max(time.Until(retryAt), time.Millisecond), func(time.Time) tea.Msg {
+				return detailRetryMsg{key: msg.key, generation: msg.generation}
+			})}
+		}
 		return nil
+	}
+	if msg.key.Group == "threads" {
+		threads, ok := msg.value.(domain.ReviewThreadList)
+		if !ok || !threads.Complete {
+			issue := &domain.FetchError{Kind: domain.ErrorTransient, Message: "GitHub returned an incomplete review thread list"}
+			field.Fail(msg.generation, issue, time.Time{})
+			m.status = issue.Message
+			m.failPendingThreadResolutions(msg.key.Item, msg.generation)
+			m.restoreThreadSelection(msg.key.Item, selectedThreadID, selectedThreadIndex)
+			return nil
+		}
 	}
 	field.Succeed(msg.generation, msg.value, msg.provenance)
 	m.detailAttempts[msg.key] = 0
@@ -193,10 +214,95 @@ func (m *Model) applyDetailMessage(msg detailFetchMsg) []tea.Cmd {
 			m.writePending = nil
 		}
 	}
-	if msg.key.Group == "threads" && m.mode == "thread" {
-		return m.loadSelectedThreadContext()
+	if msg.key.Group == "threads" {
+		m.completePendingThreadResolutions(msg.key.Item, msg.generation, msg.value.(domain.ReviewThreadList))
+		m.restoreThreadSelection(msg.key.Item, selectedThreadID, selectedThreadIndex)
+		if m.mode == "thread" {
+			return m.loadSelectedThreadContext()
+		}
 	}
 	return nil
+}
+
+func (m *Model) currentThreadSelection(item domain.ItemID) (string, int) {
+	selected, ok := m.selectedPR()
+	if !ok || selected.ID != item || m.mode != "thread" {
+		return "", m.threadIndex
+	}
+	threads := m.threadList(selected)
+	if m.threadIndex < 0 || m.threadIndex >= len(threads) {
+		return "", m.threadIndex
+	}
+	return threads[m.threadIndex].ID, m.threadIndex
+}
+
+func (m *Model) restoreThreadSelection(item domain.ItemID, threadID string, previousIndex int) {
+	selected, ok := m.selectedPR()
+	if !ok || selected.ID != item || m.mode != "thread" {
+		return
+	}
+	threads := m.threadList(selected)
+	if len(threads) == 0 {
+		m.threadIndex = 0
+		return
+	}
+	for index, thread := range threads {
+		if threadID != "" && thread.ID == threadID {
+			m.threadIndex = index
+			return
+		}
+	}
+	m.threadIndex = min(max(previousIndex, 0), len(threads)-1)
+}
+
+func (m *Model) setThreadResolutionStatus(item domain.ItemID, status string) {
+	selected, ok := m.selectedPR()
+	if ok && selected.ID == item && m.mode == "thread" {
+		m.status = status
+	}
+}
+
+func (m *Model) failPendingThreadResolutions(item domain.ItemID, generation uint64) int {
+	failed := 0
+	for key, verifyGeneration := range m.pendingThreadResolutions {
+		if key.item == item && verifyGeneration > 0 && verifyGeneration <= generation {
+			delete(m.pendingThreadResolutions, key)
+			failed++
+		}
+	}
+	if failed > 0 {
+		m.setThreadResolutionStatus(item, fmt.Sprintf("Could not verify %d thread resolution(s); the thread(s) are available again", failed))
+	}
+	return failed
+}
+
+func (m *Model) completePendingThreadResolutions(item domain.ItemID, generation uint64, value domain.ReviewThreadList) {
+	verified, unresolved := 0, 0
+	for key, verifyGeneration := range m.pendingThreadResolutions {
+		if key.item != item || verifyGeneration == 0 || verifyGeneration > generation {
+			continue
+		}
+		found := false
+		for _, thread := range value.Threads {
+			if thread.ID == key.threadID {
+				found = true
+				break
+			}
+		}
+		delete(m.pendingThreadResolutions, key)
+		if found {
+			unresolved++
+		} else {
+			verified++
+		}
+	}
+	if verified > 0 && unresolved > 0 {
+		m.setThreadResolutionStatus(item, fmt.Sprintf("%d thread resolution(s) verified; %d thread(s) remain unresolved", verified, unresolved))
+	} else if verified > 0 {
+		m.setThreadResolutionStatus(item, fmt.Sprintf("%d thread resolution(s) verified", verified))
+	} else if unresolved > 0 {
+		m.setThreadResolutionStatus(item, fmt.Sprintf("%d thread(s) remain unresolved and are available again", unresolved))
+	}
 }
 
 func (m Model) currentPR(item domain.ItemID) (domain.PR, bool) {
@@ -278,6 +384,14 @@ func (m Model) threadList(pr domain.PR) []domain.ReviewThread {
 		return nil
 	}
 	threads := append([]domain.ReviewThread(nil), value.Threads...)
+	visible := threads[:0]
+	for _, thread := range threads {
+		if _, pending := m.pendingThreadResolutions[threadResolutionKey{item: pr.ID, threadID: thread.ID}]; pending {
+			continue
+		}
+		visible = append(visible, thread)
+	}
+	threads = visible
 	sort.SliceStable(threads, func(i, j int) bool {
 		if threads[i].Path != threads[j].Path {
 			return threads[i].Path < threads[j].Path
@@ -294,6 +408,16 @@ func (m Model) threadList(pr domain.PR) []domain.ReviewThread {
 		return threads[i].ID < threads[j].ID
 	})
 	return threads
+}
+
+func (m Model) pendingThreadResolutionCount(item domain.ItemID) int {
+	count := 0
+	for key := range m.pendingThreadResolutions {
+		if key.item == item {
+			count++
+		}
+	}
+	return count
 }
 
 func (m *Model) loadSelectedThreadContext() []tea.Cmd {
@@ -369,33 +493,62 @@ func (m *Model) resolveReviewThread(pr domain.PR, threadID string) []tea.Cmd {
 		m.status = "Wait for the current GitHub action to finish"
 		return nil
 	}
+	resolutionKey := threadResolutionKey{item: pr.ID, threadID: threadID}
+	if _, alreadyPending := m.pendingThreadResolutions[resolutionKey]; alreadyPending {
+		m.status = "Thread resolution is already running in the background"
+		return nil
+	}
 	client, scheduler, item := m.opts.Actions, m.opts.Scheduler, pr.ID
 	if scheduler == nil {
 		scheduler = fetch.NewRateLimitedScheduler(2, 150*time.Millisecond, 20*time.Second)
 	}
-	m.actionRunning = true
-	m.status = "Resolving review thread"
-	return []tea.Cmd{func() tea.Msg {
+	if m.pendingThreadResolutions == nil {
+		m.pendingThreadResolutions = make(map[threadResolutionKey]uint64)
+	}
+	previousIndex := max(0, m.threadIndex)
+	m.pendingThreadResolutions[resolutionKey] = 0
+	threads := m.threadList(pr)
+	if len(threads) > 0 {
+		m.threadIndex = previousIndex % len(threads)
+	} else {
+		m.threadIndex = 0
+	}
+	m.threadScroll = 0
+	m.status = "Resolving thread in the background; advanced to the next thread"
+	cmds := []tea.Cmd{func() tea.Msg {
 		_, err := scheduler.Do(context.Background(), "github-mutation", fmt.Sprintf("resolve-thread:%s:%s:%d", item.String(), threadID, time.Now().UnixNano()), func(ctx context.Context) (any, error) {
 			return nil, client.ResolveReviewThread(ctx, item, threadID)
 		})
 		return threadResolveMsg{item: item, threadID: threadID, err: err}
 	}}
+	return append(cmds, m.loadSelectedThreadContext()...)
 }
 
 func (m *Model) applyThreadResolve(msg threadResolveMsg) []tea.Cmd {
-	m.actionRunning = false
-	pr, ok := m.selectedPR()
-	if !ok || pr.ID != msg.item {
-		m.status = "PR selection changed before thread resolution was verified"
+	resolutionKey := threadResolutionKey{item: msg.item, threadID: msg.threadID}
+	if _, pending := m.pendingThreadResolutions[resolutionKey]; !pending {
 		return nil
 	}
+	pr, ok := m.currentPR(msg.item)
+	if !ok {
+		delete(m.pendingThreadResolutions, resolutionKey)
+		return nil
+	}
+	key := detailKey(pr, "threads")
+	cmd := m.loadDetail(pr, key, true)
+	field := m.detailFields[key]
+	if cmd == nil || field == nil || !field.Phase.Active() {
+		delete(m.pendingThreadResolutions, resolutionKey)
+		m.setThreadResolutionStatus(msg.item, "Could not refresh GitHub thread state; the thread is available again")
+		return nil
+	}
+	m.pendingThreadResolutions[resolutionKey] = field.Generation
 	if msg.err != nil {
-		m.status = "Thread resolution could not be verified; press R to refresh: " + fetch.Classify(msg.err).Message
-		return nil
+		m.setThreadResolutionStatus(msg.item, "Resolve response was uncertain; checking GitHub thread state in the background")
+	} else {
+		m.setThreadResolutionStatus(msg.item, "Checking GitHub thread state in the background")
 	}
-	m.status = "Thread resolved and verified; refreshing unresolved threads"
-	return []tea.Cmd{m.loadDetail(pr, detailKey(pr, "threads"), true)}
+	return []tea.Cmd{cmd}
 }
 
 func (m *Model) beginEditor(threadID, returnMode string) {
@@ -1142,7 +1295,14 @@ func (m Model) threadView() string {
 	}
 	threads := m.threadList(pr)
 	if len(threads) == 0 {
-		return strings.Join(m.visual.panel("Review threads", []string{"No unresolved review threads", "esc back · T return to details · R refresh"}, m.width), "\n") + "\n"
+		lines := []string{"No unresolved review threads", "esc back · T return to details · R refresh"}
+		if pending := m.pendingThreadResolutionCount(pr.ID); pending > 0 {
+			lines = []string{fmt.Sprintf("Resolving %d thread(s) in the background", pending), "No other unresolved review threads", "esc back · T return to details · R refresh"}
+		}
+		if m.status != "" {
+			lines = append(lines, m.visual.paint(roleWarning, m.visual.fit(m.status, m.width)))
+		}
+		return strings.Join(m.visual.panel("Review threads", lines, m.width), "\n") + "\n"
 	}
 	if m.threadIndex >= len(threads) {
 		m.threadIndex = len(threads) - 1
