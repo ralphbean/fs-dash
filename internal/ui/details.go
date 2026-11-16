@@ -1163,7 +1163,7 @@ func (m Model) threadView() string {
 	}
 	location := fmt.Sprintf("Line %d", line)
 	if thread.IsOutdated {
-		location = fmt.Sprintf("Outdated · original line %d", thread.OriginalLine)
+		location = m.visual.paint(roleWarning, fmt.Sprintf("⚠ Outdated · original line %d", thread.OriginalLine))
 	}
 	lines = append(lines, location)
 	contextKey := detailThreadKey(pr, thread.ID)
