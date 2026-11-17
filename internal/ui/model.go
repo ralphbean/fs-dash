@@ -117,6 +117,8 @@ type Model struct {
 	detailsScroll                   int
 	threadIndex                     int
 	threadScroll                    int
+	threadScrollToBottom            bool
+	pendingGMode                    string
 	pendingThreadResolutions        map[threadResolutionKey]uint64
 	editorReturnMode                string
 	editorThreadID                  string
@@ -563,6 +565,19 @@ func (m *Model) move(delta int) {
 	i = (i + delta + len(rows)) % len(rows)
 	m.selected, m.hasSelection = rows[i].ID, true
 }
+func (m *Model) jumpListBoundary(toBottom bool) []tea.Cmd {
+	rows := m.allRows()
+	if len(rows) == 0 {
+		m.hasSelection = false
+		return nil
+	}
+	index := 0
+	if toBottom {
+		index = len(rows) - 1
+	}
+	m.selected, m.hasSelection = rows[index].ID, true
+	return m.selectedFields(false)
+}
 func (m *Model) log(level, operation, item string, attempt int, duration time.Duration, message string) {
 	m.opts.Logs.Log(ports.LogEvent{Time: m.opts.Clock.Now(), Level: level, Source: "github", Operation: operation, Item: item, Attempt: attempt, Duration: duration, Message: message})
 }
@@ -782,6 +797,37 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		}
 	case tea.KeyMsg:
 		key := msg.String()
+		if m.pendingGMode != "" {
+			pendingMode := m.pendingGMode
+			m.pendingGMode = ""
+			if key == "g" && m.mode == pendingMode && !m.help && !m.console {
+				if m.mode == "list" {
+					cmds = append(cmds, m.jumpListBoundary(false)...)
+				} else if m.mode == "thread" {
+					m.threadScroll = 0
+					m.threadScrollToBottom = false
+				}
+				break
+			}
+		}
+		if key == "g" && !m.help && !m.console && (m.mode == "list" || m.mode == "thread") {
+			m.pendingGMode = m.mode
+			break
+		}
+		if key == "G" && !m.help && !m.console {
+			switch m.mode {
+			case "list":
+				cmds = append(cmds, m.jumpListBoundary(true)...)
+				break
+			case "thread":
+				m.threadScrollToBottom = true
+				m.threadScroll = m.threadMaxScroll()
+				break
+			}
+			if m.mode == "list" || m.mode == "thread" {
+				break
+			}
+		}
 		if m.mode == "editor" {
 			cmds = append(cmds, m.handleEditorKey(msg)...)
 			break
@@ -1081,7 +1127,7 @@ func (m Model) helpView() string {
 		keys = append(keys, key)
 	}
 	sort.Strings(keys)
-	content := []string{"j/k or arrows  move selection", "h/l            previous/next filter", "e              toggle emoji/text table labels", "enter          PR details", "details: j/k scroll · T threads · c comment · m merge/queue · x close · r refresh", "threads: n/p next/previous · c comment · r resolve · R refresh", "comment: ctrl+d post · ctrl+k kill line · ctrl+w delete word · ctrl+e end line · ctrl+left/right word · ctrl+a line start", "editor: ←/→ cursor · ctrl+left/right word · ctrl+a line start · ↑/↓ scroll · enter newline · ctrl+d post · esc cancel", "esc            back", "s              toggle local star", "z              choose snooze duration", "u              unsnooze selected PR", "r              refresh all sections", "L              log console", "?              toggle help", "q              quit"}
+	content := []string{"j/k or arrows  move selection", "gg / G        first/last PR in list", "h/l            previous/next filter", "e              toggle emoji/text table labels", "enter          PR details", "details: j/k scroll · T threads · c comment · m merge/queue · x close · r refresh", "threads: n/p next/previous · j/k scroll · gg/G top/bottom · c comment · r resolve · R refresh", "comment: ctrl+d post · ctrl+k kill line · ctrl+w delete word · ctrl+e end line · ctrl+left/right word · ctrl+a line start", "editor: ←/→ cursor · ctrl+left/right word · ctrl+a line start · ↑/↓ scroll · enter newline · ctrl+d post · esc cancel", "esc            back", "s              toggle local star", "z              choose snooze duration", "u              unsnooze selected PR", "r              refresh all sections", "L              log console", "?              toggle help", "q              quit"}
 	for _, key := range keys {
 		binding := m.opts.Config.Bindings[key]
 		summary := binding.Summary

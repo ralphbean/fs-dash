@@ -7,7 +7,7 @@ Lets a developer inspect and respond to unresolved GitHub review threads in sequ
 ## Requirements
 
 ### Requirement: Unresolved thread walkthrough
-Pressing `T` in PR details SHALL open a navigable sequence of unresolved review threads. Each thread SHALL show file path, current or outdated diff context, comments in chronological order, authors, and timestamps. When a thread is outdated, the UI SHALL display a warning-colored `⚠ Outdated` marker near the top of the thread view beside its location information. The marker SHALL remain understandable when color is disabled. Diff context SHALL color added, removed, and hunk-header lines distinctly when color is enabled. Each comment SHALL appear inside its own visible frame.
+Pressing `T` in PR details SHALL open a navigable sequence of unresolved review threads. Each thread SHALL show file path, current or outdated diff context, comments in chronological order, authors, and timestamps. When a thread is outdated, the UI SHALL display a warning-colored `⚠ Outdated` marker near the top of the thread view beside its location information. The marker SHALL remain understandable when color is disabled. Diff context SHALL color added, removed, and hunk-header lines distinctly when color is enabled. Each comment SHALL appear inside its own visible frame. In the thread/diff view, `gg` SHALL scroll to the top of the current thread content and `G` SHALL scroll to its bottom without changing the selected thread. The thread footer and keyboard help SHALL show these shortcuts.
 
 #### Scenario: Thread on an outdated diff
 - **WHEN** a selected thread is marked outdated
@@ -24,6 +24,14 @@ Pressing `T` in PR details SHALL open a navigable sequence of unresolved review 
 #### Scenario: Comments have separate frames
 - **WHEN** a thread view displays multiple comments
 - **THEN** each comment's author, timestamp, and body appear within its own visible frame
+
+#### Scenario: Jump to the top of thread content
+- **WHEN** the user presses `gg` in the thread/diff view
+- **THEN** the current thread content scrolls to its top and the selected thread does not change
+
+#### Scenario: Jump to the bottom of thread content
+- **WHEN** the user presses `G` in the thread/diff view
+- **THEN** the current thread content scrolls to its bottom and the selected thread does not change
 
 ### Requirement: Reply editor preserves drafts
 The system SHALL provide a multi-line editor for a reply to the selected review thread, keep the selected thread and its context visible while editing, require an explicit post action with `ctrl+d`, and preserve the draft when posting fails. Pressing `c` in the thread walkthrough SHALL open the editor for that thread. Comment editors SHALL support killing to the end of the current line with `ctrl+k`, deleting the previous word with `ctrl+w`, moving the cursor to the current line's end with `ctrl+e`, moving to the previous or next word boundary with `ctrl+left` or `ctrl+right`, and moving to the beginning of the current line with `ctrl+a`.

@@ -21,11 +21,27 @@ The system SHALL show loading, empty, retry cooldown, and error states for each 
 - **THEN** the affected section stops spinning and shows the error and retry option
 
 ### Requirement: Keyboard navigation is stable during updates
-The system SHALL retain the selected PR by stable identity when rows refresh or reorder, and SHALL identify the active mode and available keys.
+The system SHALL retain the selected PR by stable identity when rows refresh or reorder, and SHALL identify the active mode and available keys. In PR list sections, `gg` SHALL select the first row and `G` SHALL select the last row; a boundary jump SHALL keep the selected row visible and SHALL do nothing when the section has no rows. The list footer and keyboard help SHALL show these shortcuts.
 
 #### Scenario: Rows reorder after refresh
 - **WHEN** new data changes row order
 - **THEN** selection remains on the same PR if it is still present
+
+#### Scenario: Jump to the first PR
+- **WHEN** the user presses `gg` while viewing a PR list section with rows
+- **THEN** the first row is selected and remains visible
+
+#### Scenario: Jump to the last PR
+- **WHEN** the user presses `G` while viewing a PR list section with rows
+- **THEN** the last row is selected and remains visible
+
+#### Scenario: Boundary jump on an empty section
+- **WHEN** the user presses `gg` or `G` while the current PR list section has no rows
+- **THEN** the selection remains empty
+
+#### Scenario: List boundary shortcuts are visible
+- **WHEN** the PR list footer or keyboard help is shown
+- **THEN** it identifies `gg` as top and `G` as bottom
 
 ### Requirement: List filters contain only current open PRs
 The system SHALL build every PR list section and filter only from PRs returned by the latest successful open-PR list results. A PR absent from those results SHALL NOT be synthesized from reminder state, cached enrichment, or prior list contents.

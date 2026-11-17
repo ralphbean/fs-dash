@@ -1,7 +1,7 @@
 ## MODIFIED Requirements
 
 ### Requirement: Keyboard navigation is stable during updates
-The system SHALL retain the selected PR by stable identity when rows refresh or reorder, and SHALL identify the active mode and available keys. In PR list sections, `gg` SHALL select the first row and `G` SHALL select the last row; a boundary jump SHALL keep the selected row visible and SHALL do nothing when the section has no rows.
+The system SHALL retain the selected PR by stable identity when rows refresh or reorder, and SHALL identify the active mode and available keys. In PR list sections, `gg` SHALL select the first row and `G` SHALL select the last row; a boundary jump SHALL keep the selected row visible and SHALL do nothing when the section has no rows. The list footer and keyboard help SHALL show these shortcuts.
 
 #### Scenario: Rows reorder after refresh
 - **WHEN** new data changes row order
@@ -18,3 +18,7 @@ The system SHALL retain the selected PR by stable identity when rows refresh or 
 #### Scenario: Boundary jump on an empty section
 - **WHEN** the user presses `gg` or `G` while the current PR list section has no rows
 - **THEN** the selection remains empty
+
+#### Scenario: List boundary shortcuts are visible
+- **WHEN** the PR list footer or keyboard help is shown
+- **THEN** it identifies `gg` as top and `G` as bottom

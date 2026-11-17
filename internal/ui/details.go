@@ -353,6 +353,7 @@ func (m *Model) handleDetailsKey(key string) []tea.Cmd {
 	case "T":
 		m.mode = "thread"
 		m.threadIndex, m.threadScroll = 0, 0
+		m.threadScrollToBottom = false
 		return m.openThreadWalk(pr)
 	case "c":
 		m.beginEditor("", "details")
@@ -453,17 +454,27 @@ func (m *Model) handleThreadKey(key string) []tea.Cmd {
 		if len(threads) > 0 {
 			m.threadIndex = (m.threadIndex + 1) % len(threads)
 			m.threadScroll = 0
+			m.threadScrollToBottom = false
 			return m.loadSelectedThreadContext()
 		}
 	case "p", "left":
 		if len(threads) > 0 {
 			m.threadIndex = (m.threadIndex - 1 + len(threads)) % len(threads)
 			m.threadScroll = 0
+			m.threadScrollToBottom = false
 			return m.loadSelectedThreadContext()
 		}
 	case "j", "down":
+		if m.threadScrollToBottom {
+			m.threadScroll = m.threadMaxScroll()
+			m.threadScrollToBottom = false
+		}
 		m.threadScroll++
 	case "k", "up":
+		if m.threadScrollToBottom {
+			m.threadScroll = m.threadMaxScroll()
+			m.threadScrollToBottom = false
+		}
 		m.threadScroll = max(0, m.threadScroll-1)
 	case "R":
 		return []tea.Cmd{m.loadDetail(pr, detailKey(pr, "threads"), true)}
@@ -514,6 +525,7 @@ func (m *Model) resolveReviewThread(pr domain.PR, threadID string) []tea.Cmd {
 		m.threadIndex = 0
 	}
 	m.threadScroll = 0
+	m.threadScrollToBottom = false
 	m.status = "Resolving thread in the background; advanced to the next thread"
 	cmds := []tea.Cmd{func() tea.Msg {
 		_, err := scheduler.Do(context.Background(), "github-mutation", fmt.Sprintf("resolve-thread:%s:%s:%d", item.String(), threadID, time.Now().UnixNano()), func(ctx context.Context) (any, error) {
@@ -1283,6 +1295,53 @@ func (m Model) commentWindow(comment domain.ReviewThreadComment, width int) []st
 	return lines
 }
 
+func (m Model) threadContentLines(pr domain.PR, thread domain.ReviewThread) []string {
+	lines := []string{fmt.Sprintf("Thread %d of %d · %s", m.threadIndex+1, len(m.threadList(pr)), thread.ID), "File: " + thread.Path}
+	line := thread.Line
+	if line == 0 {
+		line = thread.OriginalLine
+	}
+	location := fmt.Sprintf("Line %d", line)
+	if thread.IsOutdated {
+		location = m.visual.paint(roleWarning, fmt.Sprintf("⚠ Outdated · original line %d", thread.OriginalLine))
+	}
+	lines = append(lines, location)
+	contextKey := detailThreadKey(pr, thread.ID)
+	contextField := m.detailFields[contextKey]
+	if contextField == nil || !contextField.HasValue {
+		lines = append(lines, "Diff context · "+m.detailStateLine(contextKey))
+	} else if context, ok := contextField.Value.(domain.ReviewThreadContext); ok {
+		lines = append(lines, "Diff context:")
+		lines = append(lines, diffHunkLines(m.visual, context.DiffHunk)...)
+		if context.IsOutdated {
+			lines = append(lines, "Original location is outdated; this hunk is historical context.")
+		}
+	}
+	lines = append(lines, "", "Thread history:")
+	for _, comment := range thread.Comments {
+		lines = append(lines, m.commentWindow(comment, max(8, m.width-4))...)
+		lines = append(lines, "")
+	}
+	if !thread.CommentsComplete {
+		lines = append(lines, "Older thread comments not loaded")
+	}
+	return lines
+}
+
+func (m Model) threadMaxScroll() int {
+	pr, ok := m.selectedPR()
+	if !ok {
+		return 0
+	}
+	threads := m.threadList(pr)
+	if len(threads) == 0 {
+		return 0
+	}
+	index := min(max(m.threadIndex, 0), len(threads)-1)
+	lines := m.threadContentLines(pr, threads[index])
+	return max(0, len(lines)-max(1, m.height-8))
+}
+
 func (m Model) threadView() string {
 	pr, ok := m.selectedPR()
 	if !ok {
@@ -1316,35 +1375,7 @@ func (m Model) threadView() string {
 		}
 	}
 	thread := threads[m.threadIndex]
-	lines := []string{fmt.Sprintf("Thread %d of %d · %s", m.threadIndex+1, len(threads), thread.ID), "File: " + thread.Path}
-	line := thread.Line
-	if line == 0 {
-		line = thread.OriginalLine
-	}
-	location := fmt.Sprintf("Line %d", line)
-	if thread.IsOutdated {
-		location = m.visual.paint(roleWarning, fmt.Sprintf("⚠ Outdated · original line %d", thread.OriginalLine))
-	}
-	lines = append(lines, location)
-	contextKey := detailThreadKey(pr, thread.ID)
-	contextField := m.detailFields[contextKey]
-	if contextField == nil || !contextField.HasValue {
-		lines = append(lines, "Diff context · "+m.detailStateLine(contextKey))
-	} else if context, ok := contextField.Value.(domain.ReviewThreadContext); ok {
-		lines = append(lines, "Diff context:")
-		lines = append(lines, diffHunkLines(m.visual, context.DiffHunk)...)
-		if context.IsOutdated {
-			lines = append(lines, "Original location is outdated; this hunk is historical context.")
-		}
-	}
-	lines = append(lines, "", "Thread history:")
-	for _, comment := range thread.Comments {
-		lines = append(lines, m.commentWindow(comment, max(8, m.width-4))...)
-		lines = append(lines, "")
-	}
-	if !thread.CommentsComplete {
-		lines = append(lines, "Older thread comments not loaded")
-	}
+	lines := m.threadContentLines(pr, thread)
 	editing := m.mode == "editor" && m.editorThreadID == thread.ID
 	pageSize := max(1, m.height-8)
 	if editing {
@@ -1352,6 +1383,9 @@ func (m Model) threadView() string {
 	}
 	maxScroll := max(0, len(lines)-pageSize)
 	start := min(m.threadScroll, maxScroll)
+	if m.threadScrollToBottom {
+		start = maxScroll
+	}
 	end := min(len(lines), start+pageSize)
 	visible := make([]string, 0, pageSize+2)
 	if start > 0 {
@@ -1382,7 +1416,7 @@ func (m Model) threadView() string {
 	if m.status != "" {
 		view = append(view, m.visual.paint(roleWarning, m.visual.fit(m.status, m.width)))
 	}
-	footer := "esc back · n/p next/previous thread · j/k scroll · c comment · r resolve · R refresh · T details"
+	footer := "esc back · n/p next/previous thread · j/k scroll · gg top · G bottom · c comment · r resolve · R refresh · T details"
 	if editing {
 		footer = "ctrl+d post · ctrl+k kill line · ctrl+w delete word · ctrl+e end line · esc cancel"
 	}
